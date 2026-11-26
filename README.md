@@ -4,7 +4,8 @@ LSPosed / Xposed 模块，包名 `io.github.wumisc.antiburn`。给 OLED 屏做�
 
 ## 反馈
 
-- **问题反馈、功能建议**：直接开 issue 👉 https://github.com/wumisc/antiburn/issues
+- **App 内反馈**：`功能设置 › 反馈问题`，一句话描述，自动带机型 / 系统版本 / 模块版本与最近日志（v3.4.1 起）
+- **问题反馈、功能建议**：也可以直接开 issue 👉 https://github.com/wumisc/antiburn/issues
 - 开 issue 请附：机型、ROM 版本、Android 版本、LSPosed 版本、模块版本号，以及「诊断日志」导出（App 首页 › 功能设置 › 诊断日志 › 导出）。有日志和没日志，定位速度差一个数量级。
 - 这里是**主仓库**：issue 在这里收，源码也在这里跟进。
 - 安装入口是 LSPosed 平台镜像 `Xposed-Modules-Repo/io.github.wumisc.antiburn`，那个仓库的 issues 被平台统一禁用，请不要在那里留言（写了没人能看到）。
