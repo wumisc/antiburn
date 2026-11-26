@@ -1,0 +1,13 @@
+# 签名与本地配置：绝不入库
+*.jks
+*.keystore
+keystore.properties
+local.properties
+
+# 构建产物
+build/
+.gradle/
+.cxx/
+*.apk
+*.iml
+.idea/
