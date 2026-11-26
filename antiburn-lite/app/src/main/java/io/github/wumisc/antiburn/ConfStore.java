@@ -1,0 +1,2105 @@
+package io.github.wumisc.antiburn;
+
+import android.content.Context;
+import android.util.Base64;
+
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
+
+/**
+ * 配置存储（v1.7-fixed）。
+ *
+ * 原版问题：
+ *  1. 写入是「echo b64 | base64 -d > /data/local/tmp/antiburn.conf」——先清空目标文件再写，
+ *     su 中途失败/超时就会留下一个空文件，所有开关丢失；多个保存并发时还会互相覆盖。
+ *  2. 只写 /data/local/tmp。SystemUI / 抖音进程被 SELinux 挡住读 shell_data_file，
+ *     Config.reload() 永远读不到，表现为「设置保存了但完全不生效」。
+ *  3. 白名单页在 conf 尚不存在时直接失败，第一次用永远保存不了。
+ *  4. 自定义诗句是多行文本，直接写进「一行一个 key」的 conf 会把后续内容切成非法行。
+ *
+ * 修复：
+ *  - 每次写入同时落一份「应用内镜像」files/antiburn.conf（无需 root，永久可读），
+ *    由 ConfigProvider 暴露给被 hook 的进程；root 通道继续保留，兼容外部直接改 conf。
+ *  - root 写入改为「写 .tmp → mv 原子替换」，失败不破坏原文件。
+ *  - 所有改写走 updateEx()：保留未知 key 与注释，不再整表重建导致其它设置丢失。
+ *  - 提供默认配置，conf 不存在时自动生成，白名单/磁贴首次点击即可保存。
+ */
+public final class ConfStore {
+
+    public static final String CONF = "/data/local/tmp/antiburn.conf";
+    private static final String CONF_TMP = CONF + ".tmp";
+    private static final String MIRROR_NAME = "antiburn.conf";
+    private static final String MIRROR_TMP_NAME = "antiburn.conf.tmp";
+    /**
+     * 公共存储镜像：Android 11+ 包可见性可能让被 hook 的第三方 App 解析不到导出的
+     * ContentProvider，所以额外落一份纯文本到 Download（隐藏文件），hook 侧可直接 FileReader。
+     */
+    public static final String EXTERNAL_MIRROR = "/sdcard/Download/.antiburn.conf";
+
+    /**
+     * 日志目录：公共存储下用户能直接看到的位置（文件管理器 / 数据线 / 电脑都能取）。
+     * Android 11+ 普通应用无权在 /sdcard/Android/ 下自建目录，只能由 App 侧用 su 预建，
+     * 之后 SystemUI(system uid) 才能写入 —— 具体见 XposedInit 的路径探测。
+     */
+    public static final String LOG_DIR = "/storage/emulated/0/Android/Prevent burn-in";
+    public static final String LOG_FILE = LOG_DIR + "/antiburn.log";
+    /** 兜底目录：/data/local/tmp 下自建子目录并放开权限，保证 system uid 总有地方写 */
+    public static final String LOG_DIR_FALLBACK = "/data/local/tmp/antiburn";
+    /** 单文件上限：超过就 rename 成 .1，与 XposedInit 的轮转口径保持一致（512KB） */
+    private static final long LOG_ROTATE_BYTES = 512 * 1024L;
+    /**
+     * v3.2.17：本进程直写失败后补 su 的最小间隔。
+     *
+     * <p>su 授权在部分 ROM 上每次都要弹窗；无障碍探针一轮可能追加好几批，
+     * 不节流会把用户烦死。10 秒与 XposedInit 的 SU_WRITE_INTERVAL_MS 同口径。
+     */
+    private static final long SU_APPEND_INTERVAL_MS = 10_000L;
+    /** 上一次走 su 追加的时刻（只在主写失败时才更新）。 */
+    private static long lastSuAppendAt = 0L;
+    /**
+     * 公共日志目录被分区存储拒绝后，短暂跳过直写。
+     *
+     * <p>v3.2.34：被注入的第三方进程没有 App 自己的「所有文件访问」授权，直写
+     * {@code /sdcard/Android/Prevent burn-in/antiburn.log} 会被 FUSE 拒绝；旧实现每条
+     * DIAG 行都撞一次，logcat 里 MediaProvider 每秒刷屏，既拖慢探针也淹没真实错误。
+     * 一次失败后 60 秒内直接走 su / 私有镜像，不再重复撞墙。</p>
+     */
+    private static volatile long publicLogBlockedUntil = 0L;
+    private static final long PUBLIC_LOG_BLOCK_MS = 60_000L;
+
+    /** root 写入成功且读回校验通过 */
+    public static final int WRITE_OK = 0;
+    /** root 不可用/写入失败，但应用内镜像已保存（Hook 侧通过 ConfigProvider 仍可生效） */
+    public static final int WRITE_MIRROR_ONLY = 1;
+    /** 镜像也写不进去，彻底失败 */
+    public static final int WRITE_FAILED = 2;
+
+    private static volatile Context appCtx;
+    private static final Object LOCK = new Object();
+
+    /**
+     * root / 外部镜像的同步队列。
+     *
+     * <p>旧实现把 3 次 su（写 conf、读回校验、写外部镜像）全部放在 save 的同步路径里，
+     * 每次 su 最多等 4s，最坏一次保存要阻塞 12s。而 su 在 KernelSU / Magisk 上
+     * 每次都要走授权通道，本就慢。用户点一下开关就卡住，于是「保存不住」的投诉里
+     * 有一半其实是「保存没完成就被杀了」。
+     *
+     * <p>关键事实：应用内镜像才是唯一权威来源（Hook 侧经 ConfigProvider 读它），
+     * root conf 与外部镜像只是给「外部工具/第三方进程」的兼容副本。
+     * 既然是副本，就不该阻塞用户操作。
+     *
+     * <p>因此改为：保存 = 写镜像（毫秒级，磁记录级同步），su 通道交给这里的
+     * 单线程 worker 合并执行 —— 连续点 10 个开关只产生 1 次 su，且永远只写最新内容。
+     */
+    private static final ExecutorService SYNC = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "antiburn-conf-sync");
+        t.setDaemon(true);
+        return t;
+    });
+    private static final AtomicReference<String> pendingSync = new AtomicReference<>();
+    private static final AtomicBoolean syncQueued = new AtomicBoolean(false);
+    /** root 通道最后一次同步结果，供界面显示真实状态（不再影响「保存成功」判定）。 */
+    private static volatile String lastSyncState = "未同步";
+    private static volatile long rootCheckedAt;
+    private static volatile boolean rootCached;
+    /** 最近一次写盘使用的 rev；配合 max(now, base+1) 保证时间回拨后仍单调递增 */
+    private static volatile long lastStampRev = 0L;
+    /** root 副本同步结果单独缓存，不再污染 hasRoot() 的「id -u 是否为 0」语义 */
+    private static volatile boolean syncOk;
+    private static volatile long syncAt;
+    /** 镜像是否仍是「启动时的默认配置」，供后台 su 迁移判断是否允许覆盖 */
+    private static volatile boolean mirrorIsDefault;
+
+    private ConfStore() {
+    }
+
+    /** 必须在应用进程入口调用（AbApplication / Activity / TileService / Provider 都会调）。 */
+    public static void init(Context ctx) {
+        if (ctx == null) {
+            return;
+        }
+        Context a = ctx.getApplicationContext();
+        appCtx = (a != null) ? a : ctx;
+        // v2.5：App 进程一启动就把镜像建好（纯本地文件 IO，毫秒级，绝不触发 su）。
+        // 这样之后任何写入都有完整基底，既不需要在 commit() 主线程里跑 su，
+        // 也不会出现「迁移线程几秒后回来覆盖用户刚点的开关」的竞态。
+        initMirrorFast();
+    }
+
+    /** 同步建立镜像基底：优先直读旧 conf，读不到用默认配置；全程无 su、无阻塞。 */
+    private static void initMirrorFast() {
+        if (readMirror() != null) {
+            return;
+        }
+        synchronized (LOCK) {
+            if (readMirror() != null) {
+                return;
+            }
+            String conf = readConfDirect();
+            boolean fromConf = conf != null && !conf.trim().isEmpty();
+            String base = fromConf ? conf : defaultContent();
+            writeMirror(base);
+            mirrorIsDefault = !fromConf;
+            appendAudit("MIRROR fast src=" + (fromConf ? "conf-direct" : "default"));
+        }
+    }
+
+    /** 直接读 /data/local/tmp 旧 conf；SELinux 拒绝时立即失败，不 fork su、不阻塞。 */
+    private static String readConfDirect() {
+        try {
+            File f = new File(CONF);
+            if (!f.exists() || f.length() <= 0 || f.length() > 65536L) {
+                return null;
+            }
+            try (FileInputStream in = new FileInputStream(f)) {
+                ByteArrayOutputStream bos = new ByteArrayOutputStream();
+                byte[] buf = new byte[4096];
+                int n;
+                while ((n = in.read(buf)) > 0) {
+                    bos.write(buf, 0, n);
+                }
+                return new String(bos.toByteArray(), StandardCharsets.UTF_8);
+            }
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static File mirrorFile() {
+        Context c = appCtx;
+        return c == null ? null : new File(c.getFilesDir(), MIRROR_NAME);
+    }
+
+    private static File mirrorTmpFile() {
+        Context c = appCtx;
+        return c == null ? null : new File(c.getFilesDir(), MIRROR_TMP_NAME);
+    }
+
+    /** 默认配置：与 AbState / Config 的默认值保持一致。 */
+    public static String defaultContent() {
+        StringBuilder sb = new StringBuilder();
+        sb.append("enable_status=1\n");
+        sb.append("enable_island_link=1\n");
+        sb.append("enable_lyric_link=1\n");
+        sb.append("enable_shift=1\n");
+        sb.append("enable_navigation=0\n");
+        sb.append("enable_poem=0\n");
+        sb.append("enable_ball=0\n");
+        sb.append("enable_log=0\n");
+        sb.append("enable_icon=0\n");
+        // v2.7.4：默认界面方案按机型识别（魅族 → flyme）。配置文件里已有 ui_style 时
+        // 一律以用户保存的值为准，这里只决定「全新安装、还没保存过」的初始值。
+        sb.append("ui_style=").append(UiStyle.detect(
+                android.os.Build.MANUFACTURER, android.os.Build.BRAND,
+                android.os.Build.DISPLAY, android.os.Build.PRODUCT)).append("\n");
+        sb.append("enable_douyin_top=0\n");
+        sb.append("enable_douyin_bottom=0\n");
+        sb.append("enable_douyin_like=0\n");
+        sb.append("enable_douyin_right_top=0\n");
+        sb.append("enable_douyin_left_top=0\n");
+        sb.append("enable_live=1\n");
+        sb.append("enable_drama_top=0\n");
+        sb.append("enable_drama_bottom=0\n");
+        sb.append("enable_drama_like=0\n");
+        sb.append("enable_drama_right_top=0\n");
+        sb.append("enable_drama_left_top=0\n");
+        sb.append("enable_drama_swipe=0\n");
+        // v2.6.8：快手 / 哔哩哔哩正式接入。两个总开关 + 四个共用区域开关，
+        // 一律默认关闭 —— 新功能不改变用户升级后看到的界面。
+        sb.append("enable_kuaishou=0\n");
+        sb.append("enable_bilibili=0\n");
+        sb.append("enable_ks_right=0\n");
+        sb.append("enable_ks_top=0\n");
+        sb.append("enable_ks_bottom=0\n");
+        sb.append("enable_ks_corner=0\n");
+        sb.append("enable_bili_right=0\n");
+        sb.append("enable_bili_top=0\n");
+        sb.append("enable_bili_bottom=0\n");
+        sb.append("enable_bili_corner=0\n");
+        sb.append("hide_duration=30\n");
+        sb.append("show_duration=10\n");
+        // v2.8：名单分黑白两种解释，模式与两份名单都是独立键。
+        // 缺 list_mode 的旧配置按 white 解释，升级后行为不变。
+        sb.append(KEY_MODE).append('=').append(MODE_WHITE).append('\n');
+        sb.append(KEY_WHITE).append("=\n");
+        sb.append(KEY_BLACK).append("=\n");
+        // 缺 engine 的旧配置按 lsposed 解释（normEngine 兜底），这里写出来是为了
+        // 让用户能在 conf 里直接看到这一项存在，而不是只有 UI 上能改。
+        sb.append(KEY_ENGINE).append('=').append(ENGINE_LSPOSED).append('\n');
+        // v2.8.2 稳定版：应用内固定区域兜底遮盖，默认开。
+        // 与引擎选择无关：即使 LSPosed 没把模块注入目标视频 App 进程（真机日志实证），
+        // 只要无障碍服务连着，右侧按钮列 / 顶部标题 / 底部导航就能周期变黑。
+        // 已有配置缺这个键时，BurnInMaskService.Cfg 同样按 true 处理，升级即生效。
+        // v3.0.16：应用内遮盖默认开 —— 仅无障碍（overlay）引擎生效。
+        // 免 root 没有位置微移，这是保护抖音/红果/快手/B站固定区域的唯一通道；
+        // LSPosed 引擎下 Hook 侧仍强制不铺黑（Config.ao=false），两套互不干扰。
+        sb.append("enable_app_overlay=1\n");
+        sb.append("enable_a11y_yield_notify=1\n");
+        sb.append("enable_sys_overlay=0\n");
+        return sb.toString();
+    }
+
+    /** 读应用内镜像（无 root、无 IPC，瞬时完成）。 */
+    public static String readMirror() {
+        File f = mirrorFile();
+        if (f == null || !f.exists() || f.length() <= 0) {
+            return null;
+        }
+        try (FileInputStream in = new FileInputStream(f)) {
+            ByteArrayOutputStream bos = new ByteArrayOutputStream();
+            byte[] buf = new byte[4096];
+            int n;
+            while ((n = in.read(buf)) > 0) {
+                bos.write(buf, 0, n);
+            }
+            String s = new String(bos.toByteArray(), StandardCharsets.UTF_8);
+            return s.trim().isEmpty() ? null : s;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /** 只写应用内镜像（供 ConfigProvider 把旧 conf 同步到镜像）。 */
+    public static boolean writeMirrorOnly(String content) {
+        if (content == null) {
+            return false;
+        }
+        synchronized (LOCK) {
+            return writeMirror(content);
+        }
+    }
+
+    private static boolean writeMirror(String content) {
+        File tmp = mirrorTmpFile();
+        File dst = mirrorFile();
+        if (tmp == null || dst == null) {
+            return false;
+        }
+        try {
+            try (FileOutputStream fo = new FileOutputStream(tmp, false)) {
+                fo.write(content.getBytes(StandardCharsets.UTF_8));
+                fo.flush();
+                fo.getFD().sync();
+            }
+            if (tmp.renameTo(dst)) {
+                return true;
+            }
+            // 极少数文件系统 rename 覆盖失败：删除后重试
+            //noinspection ResultOfMethodCallIgnored
+            dst.delete();
+            return tmp.renameTo(dst);
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /**
+     * 读取配置全文：以应用内镜像为唯一权威来源（App 的每次保存都会同时更新它），
+     * 这样 UI / 磁贴 / 白名单页 / Hook 侧看到的是同一份内容。
+     * 镜像不存在时（从旧版本升级、首次安装）才回退到 su 读 conf；迁移由
+     * migrateIfNeededAsync() 在应用启动时完成。外部手工改 /data/local/tmp 不再被读取。
+     */
+    public static String read() {
+        String mirror = readMirror();
+        if (mirror != null && !mirror.trim().isEmpty()) {
+            return mirror;
+        }
+        String out = execSuCapture("cat " + CONF + " 2>/dev/null");
+        return (out != null && !out.trim().isEmpty()) ? out : null;
+    }
+
+    /**
+     * 确保应用内镜像存在，返回其内容。
+     *
+     * <p>v2.5：init() 已在进程入口同步建好镜像，这里只做兜底，且**绝不触发 su**
+     * —— commit() 跑在主线程，一次 su 最长 20s 会直接 ANR。
+     * 旧 conf 的 su 迁移由 migrateIfNeededAsync() 在后台完成，且只在镜像仍为默认时合并。</p>
+     */
+    public static String ensureMirror() {
+        String m = readMirror();
+        if (m != null && !m.trim().isEmpty()) {
+            return m;
+        }
+        initMirrorFast();
+        m = readMirror();
+        return (m != null && !m.trim().isEmpty()) ? m : defaultContent();
+    }
+
+    /** 兼容旧调用：是否「至少保存成功」。 */
+    public static boolean write(String content) {
+        return writeEx(content) != WRITE_FAILED;
+    }
+
+    /**
+     * 原子写入配置全文。返回 WRITE_OK / WRITE_FAILED。
+     *
+     * <p>语义变更（v2.1）：返回 WRITE_OK 表示「已保存且下个周期必然生效」，
+     * 不再要求 root 写入成功 —— 因为生效链路走的是应用内镜像 + ConfigProvider，
+     * 与 /data/local/tmp 无关。root 副本由后台线程同步，失败只影响外部工具读取，
+     * 不影响模块自身功能，因此不再让用户为此看到一条吓人的失败提示。
+     *
+     * <p>性能：写入路径只有一次本地文件写 + fsync，没有 su、没有 IPC、没有回读校验
+     * （回读校验原本是为了确认 su 写成功，现在镜像写完即成功，无需校验）。
+     */
+    public static int writeEx(String content) {
+        return writeEx(content, null);
+    }
+
+    /** 带变更明细的写入：审计行能直接回答「谁把哪个键改成了什么」。 */
+    public static int writeEx(String content, String changes) {
+        if (content == null) {
+            return WRITE_FAILED;
+        }
+        // 每次写入都盖一个单调递增的版本号：Hook 侧（SystemUI）用它判断
+        // 「手上这份配置是不是比我已经生效的那份更旧」，彻底堵死「重启后先读到旧副本」
+        // 导致总开关自己变回关闭的问题。
+        final String stamped = stampRev(content);
+        synchronized (LOCK) {
+            if (writeMirror(stamped)) {
+                // 镜像已落盘 = 保存成功。副本同步异步进行，绝不阻塞调用线程。
+                mirrorIsDefault = false;
+                scheduleSync(stamped);
+                appendAudit("WRITE ok rev=" + revOf(stamped)
+                        + " status=" + valueOf(stamped, "enable_status")
+                        + " by=" + caller() + (changes == null ? "" : " " + changes));
+                return WRITE_OK;
+            }
+        }
+        // 私有目录写不进去（存储隔离 / 空间不足 / 目录被系统清理）：
+        // 交给后台 root 通道再救一次，但仍然如实返回失败 ——
+        // 界面必须提示「没存住」，而不是让用户下次打开才发现开关又回去了。
+        scheduleSync(stamped);
+        appendAudit("WRITE fail rev=" + revOf(stamped) + " by=" + caller());
+        return WRITE_FAILED;
+    }
+
+    /**
+     * 在首行写入 rev=，并去掉旧 rev 行。
+     *
+     * <p>v2.5：不再直接用墙钟时间。NTP 校时 / 手动改时间 / 时区回拨会让新配置的
+     * rev 反而小于已生效版本，Config.reload() 里 `rev < appliedRev` 会把之后所有保存
+     * 永久拒绝（开关再也存不住，只能杀进程）。现在取 max(当前时间, 上次 rev+1,
+     * 现有镜像 rev+1)，保证任何情况下都严格递增。</p>
+     */
+    private static String stampRev(String content) {
+        long rev;
+        synchronized (LOCK) {
+            long base = Math.max(lastStampRev, revOf(readMirror()));
+            rev = Math.max(System.currentTimeMillis(), base + 1L);
+            lastStampRev = rev;
+        }
+        StringBuilder sb = new StringBuilder("rev=").append(rev).append('\n');
+        for (String line : content.split("\n", -1)) {
+            if (line.startsWith("rev=") || line.trim().isEmpty()) {
+                continue;
+            }
+            sb.append(line).append('\n');
+        }
+        return sb.toString();
+    }
+
+    /** 取配置文本里的 rev；老版本没有该键时返回 0（视作最旧）。 */
+    public static long revOf(String content) {
+        if (content == null) {
+            return 0L;
+        }
+        for (String line : content.split("\n")) {
+            String t = line.trim();
+            if (t.startsWith("rev=")) {
+                try {
+                    return Long.parseLong(t.substring(4).trim());
+                } catch (Throwable ignored) {
+                    return 0L;
+                }
+            }
+        }
+        return 0L;
+    }
+
+    /** 取某个 key 的值，取不到返回 "?"。仅用于审计日志。 */
+    private static String valueOf(String content, String key) {
+        for (String line : content.split("\n")) {
+            String t = line.trim();
+            if (t.startsWith(key + "=")) {
+                return t.substring(key.length() + 1).trim();
+            }
+        }
+        return "?";
+    }
+
+    /** 把本次变更写成紧凑的一行，值过长的（诗句 / 白名单）截断，避免日志膨胀。 */
+    private static String describeChanges(Map<String, String> updates) {
+        StringBuilder sb = new StringBuilder("ch=");
+        int n = 0;
+        for (Map.Entry<String, String> e : updates.entrySet()) {
+            if (n++ > 0) {
+                sb.append(',');
+            }
+            if (n > 8) {
+                sb.append("...");
+                break;
+            }
+            String v = e.getValue();
+            if (v == null) {
+                v = "<del>";
+            } else if (v.length() > 24) {
+                v = v.substring(0, 24) + "~";
+            }
+            sb.append(e.getKey()).append('=').append(v);
+        }
+        return sb.toString();
+    }
+
+    /**
+     * 保存审计日志：每次写配置留下「谁写的 / 版本号 / 关键值」。
+     *
+     * <p>「开关记不住」这类问题靠猜没用 —— 必须能回答「19:31:02 那次 0 是谁写进去的」。
+     * 审计文件放在应用私有目录（无 SELinux 麻烦），导出日志时由 su 一并复制到
+     * /storage/emulated/0/Android/Prevent burn-in/ 下。</p>
+     */
+    public static void appendAudit(String s) {
+        File f = auditFile();
+        if (f == null) {
+            return;
+        }
+        try {
+            long now = System.currentTimeMillis();
+            if (f.length() > 64 * 1024L) {
+                File old = new File(f.getAbsolutePath() + ".1");
+                // 先尝试直接 rename；只有目标已存在导致失败时才删旧备份重试。
+                // 旧实现先 delete 再 rename，rename 一旦失败备份已经丢了。
+                if (!f.renameTo(old)) {
+                    //noinspection ResultOfMethodCallIgnored
+                    old.delete();
+                    //noinspection ResultOfMethodCallIgnored
+                    f.renameTo(old);
+                }
+            }
+            try (FileOutputStream fo = new FileOutputStream(f, true)) {
+                fo.write((now + " " + s + "\n").getBytes(StandardCharsets.UTF_8));
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static File auditFile() {
+        Context c = appCtx;
+        return c == null ? null : new File(c.getFilesDir(), "save-audit.log");
+    }
+
+    /** 找出第一个「非 ConfStore 自己」的调用方，用来区分 App / 磁贴 / 白名单页 / Provider。 */
+    private static String caller() {
+        try {
+            StackTraceElement[] st = new Throwable().getStackTrace();
+            for (StackTraceElement e : st) {
+                String cn = e.getClassName();
+                if (!cn.equals(ConfStore.class.getName()) && !cn.startsWith("java.")) {
+                    String simple = cn.substring(cn.lastIndexOf('.') + 1);
+                    return simple + "." + e.getMethodName() + ":" + e.getLineNumber();
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return "?";
+    }
+
+    /**
+     * 把内容投递给同步 worker。连续多次调用只保留最新一份，worker 会自动合并。
+     * 任何异常都被吞掉：副本同步失败不能影响「已保存」这个事实。
+     */
+    private static void scheduleSync(String content) {
+        pendingSync.set(content);
+        if (syncQueued.getAndSet(true)) {
+            return; // 已有 worker 在跑，它循环时会取到最新内容
+        }
+        try {
+            SYNC.execute(() -> {
+                try {
+                    while (true) {
+                        String c = pendingSync.getAndSet(null);
+                        if (c == null) {
+                            syncQueued.set(false);
+                            // 收尾竞态：清标记的瞬间可能又有人投递，抢回标记继续跑
+                            if (pendingSync.get() != null && syncQueued.compareAndSet(false, true)) {
+                                continue;
+                            }
+                            return;
+                        }
+                        syncToRoot(c);
+                    }
+                } catch (Throwable t) {
+                    syncQueued.set(false);
+                    lastSyncState = "同步异常: " + t.getClass().getSimpleName();
+                }
+            });
+        } catch (Throwable t) {
+            // 线程池拒绝（极罕见）：放弃副本同步，但保存本身已成功
+            syncQueued.set(false);
+            lastSyncState = "同步线程不可用";
+        }
+    }
+
+    /**
+     * 把同一份内容写到 root conf 与外部镜像。两条通道合并成「一次 su 调用」，
+     * 相比旧实现的 3 次 fork，进程创建开销降到 1/3。
+     */
+    private static void syncToRoot(String content) {
+        String b64 = Base64.encodeToString(
+                content.getBytes(StandardCharsets.UTF_8), Base64.NO_WRAP);
+        // 先写 .tmp 再 mv，任一环节失败原文件保持完整；两条通道互不影响，末尾 true 保证退出码为 0
+        String cmd = "{ echo '" + b64 + "' | base64 -d > " + CONF_TMP
+                + " && chmod 644 " + CONF_TMP
+                + " && mv -f " + CONF_TMP + " " + CONF
+                + " && chmod 644 " + CONF + "; } 2>/dev/null; "
+                + "{ echo '" + b64 + "' | base64 -d > " + EXTERNAL_MIRROR + ".tmp"
+                + " && mv -f " + EXTERNAL_MIRROR + ".tmp " + EXTERNAL_MIRROR
+                + " && chmod 644 " + EXTERNAL_MIRROR + "; } 2>/dev/null; true";
+        boolean ok = execSu(cmd);
+        syncAt = System.currentTimeMillis();
+        syncOk = ok;
+        lastSyncState = ok ? "已同步 root 副本" : "root 不可用，仅用应用内配置（功能正常）";
+    }
+
+    /** 最近一次 root 副本同步的结果描述，供界面展示；不影响功能判定。 */
+    public static String syncState() {
+        return lastSyncState;
+    }
+
+    /** 旧配置 + 旧日志的清理命令：所有会残留历史内容的位置一次删干净。 */
+    private static String wipeCmd(boolean logsOnly) {
+        StringBuilder sb = new StringBuilder("rm -f");
+        if (!logsOnly) {
+            sb.append(" \"").append(CONF).append("\" \"").append(CONF_TMP).append("\"")
+                    .append(" \"").append(EXTERNAL_MIRROR).append("\" \"").append(EXTERNAL_MIRROR).append(".tmp\"");
+        }
+        sb.append(" \"").append(LOG_FILE).append("\" \"").append(LOG_FILE).append(".1\"")
+                .append(" \"").append(LOG_DIR).append("\"/antiburn*.log")
+                .append(" \"").append(LOG_DIR_FALLBACK).append("\"/antiburn*.log")
+                .append(" \"").append(LOG_DIR_FALLBACK).append("\"/antiburn_diag.log")
+                .append(" 2>/dev/null; true");
+        return sb.toString();
+    }
+
+    /** 应用内私有目录里的 hook 日志（ConfigProvider 回传那一路）。 */
+    private static void deleteHookLog() {
+        try {
+            Context c = appCtx;
+            if (c == null) {
+                return;
+            }
+            File f = new File(c.getFilesDir(), ConfigProvider.HOOK_LOG_FILE);
+            if (f.exists()) {
+                //noinspection ResultOfMethodCallIgnored
+                f.delete();
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /**
+     * v3.2.7：**彻底重建**。删掉所有旧配置副本与全部旧日志，再写一份全新默认配置。
+     *
+     * <p>为什么需要：跨版本升级时旧 conf 的键集会一路带下去 —— 已废弃的字段仍留在文件里、
+     * 旧值继续被解析（比如早被废弃的旧开关键），日志也从上一版
+     * 一直累积，排障时永远先看到「旧版本的行」。这里直接清表重建，升级后看到的就是
+     * 当前版本的全新默认配置。</p>
+     *
+     * <p>调用点：① App 升级后首次启动自动执行（MainActivity 里按 versionCode 判定）；
+     * ② 通用页「重建配置」按钮。执行完必须重启系统界面，SystemUI 才会重新读新 conf。</p>
+     */
+    public static boolean resetAll() {
+        synchronized (LOCK) {
+            execSu(wipeCmd(false));
+            try {
+                File m = mirrorFile();
+                if (m != null && m.exists()) {
+                    //noinspection ResultOfMethodCallIgnored
+                    m.delete();
+                }
+                File mt = mirrorTmpFile();
+                if (mt != null && mt.exists()) {
+                    //noinspection ResultOfMethodCallIgnored
+                    mt.delete();
+                }
+            } catch (Throwable ignored) {
+            }
+            deleteHookLog();
+            String content = stampRev(defaultContent());
+            writeMirror(content);
+            mirrorIsDefault = false;
+            syncToRoot(content);
+            appendAudit("RESET vc=" + BuildConfig.VERSION_CODE + " 旧配置与旧日志已清空");
+            return true;
+        }
+    }
+
+    /**
+     * v3.2.16：本进程直接删日志文件，su 只当兜底。
+     *
+     * <p>真机实锤（3.2.15 那份日志）：升级清空的「起始标记」写进去了，可 11-22 的旧行
+     * 一条不少地留在文件里 —— 说明 {@code rm} 那一步根本没成功（su 授权被拒 / 被拦），
+     * 而 {@code wipeCmd} 是唯一删除手段，于是「覆盖安装自动清日志」实际上一直没清掉。
+     * 目录 0777、文件 0666 是本进程自己就有权限的，先直删；删不掉再交给 su。</p>
+     */
+    private static void wipeDirect() {
+        try {
+            //noinspection ResultOfMethodCallIgnored
+            new File(LOG_FILE).delete();
+            //noinspection ResultOfMethodCallIgnored
+            new File(LOG_FILE + ".1").delete();
+        } catch (Throwable ignored) {
+        }
+        deleteLogsInDir(LOG_DIR);
+        deleteLogsInDir(LOG_DIR_FALLBACK);
+    }
+
+    /** 删除目录下所有 antiburn 日志（主文件 / 轮转 / 诊断），不动别的文件。 */
+    private static void deleteLogsInDir(String dir) {
+        try {
+            File d = new File(dir);
+            File[] fs = d.listFiles();
+            if (fs == null) {
+                return;
+            }
+            for (File f : fs) {
+                String n = f.getName();
+                if (n.startsWith("antiburn") && (n.endsWith(".log") || n.endsWith(".log.1"))) {
+                    //noinspection ResultOfMethodCallIgnored
+                    f.delete();
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /** v3.2.7：只清日志，不动配置。通用页「清空日志」用。 */
+    public static void clearLogs() {
+        wipeDirect();
+        execSu(wipeCmd(true));
+        deleteHookLog();
+        appendAudit("LOGS cleared, 之后只写 v" + BuildConfig.VERSION_NAME);
+    }
+
+    /**
+     * v3.2.15：覆盖安装（versionCode 变化）后自动清空旧日志并重建，返回是否真的清过。
+     *
+     * <p>用户反馈：「跑的还是旧版，日志又是轮转后的残卷，看不出到底新旧」——
+     * 之前只在<b>打开模块</b>时才清，装完直接开快手的人根本触发不到。现在本方法
+     * 由 {@code AbApplication.onCreate()} 调用，任何进程（含 Provider 被 Hook 拉起）
+     * 只要启动就会先判断一次；MainActivity 复用同一入口，只多一个提示。
+     *
+     * <p>清空范围沿用 {@link #wipeCmd(boolean)}：主日志 + 轮转的 .1 + 兜底目录 +
+     * 私有镜像，一个不留；随后立刻写一行起始标记，让「刚清完」这件事在文件第一行
+     * 就能看见，不必再靠行数猜。</p>
+     *
+     * <p>记账口径与杀进程一致：先判、后写 last_vc，清了就记，避免重复清；
+     * 首次安装（last_vc=0）不清 —— 那时候本来就没有旧日志。</p>
+     */
+    public static boolean clearLogsIfUpgraded(android.content.Context ctx) {
+        if (ctx == null) {
+            return false;
+        }
+        try {
+            android.content.SharedPreferences meta =
+                    ctx.getSharedPreferences("antiburn_meta", android.content.Context.MODE_PRIVATE);
+            int last = meta.getInt("last_vc", 0);
+            int now = BuildConfig.VERSION_CODE;
+            if (last == 0 || last == now) {
+                // 首次安装或同版本重复启动：不动日志
+                if (last == 0) {
+                    meta.edit().putInt("last_vc", now).apply();
+                }
+                return false;
+            }
+            // 先记账再动手：清的过程中被二次拉起不会重复执行
+            meta.edit().putInt("last_vc", now).apply();
+            clearLogs();
+            appendRawLine(System.currentTimeMillis() + " [app/self] LOG ver="
+                    + BuildConfig.VERSION_NAME + " vc=" + now
+                    + " 旧日志已清空（含 .1 与私有镜像），新日志从这里开始");
+            // 留给界面一次性提示：清空可能发生在 Application 里（用户还没看到界面）
+            meta.edit().putBoolean("cleared_pending", true).apply();
+            return true;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /**
+     * 旧版本升级迁移：旧版只写 /data/local/tmp，没有应用内镜像，
+     * 会导致 ConfigProvider 返回 null、模块跑默认值。启动时异步补齐一次。
+     * su 会阻塞，必须在后台线程执行。
+     */
+    public static void migrateIfNeededAsync() {
+        Thread t = new Thread(() -> {
+            // 只有「镜像仍是启动时的默认配置」才需要迁移；
+            // 用户已经保存过（镜像带 rev / 内容已变）时绝不覆盖。
+            if (!mirrorIsDefault) {
+                return;
+            }
+            String conf = execSuCapture("cat " + CONF + " 2>/dev/null");
+            if (conf == null || conf.trim().isEmpty()) {
+                return;
+            }
+            synchronized (LOCK) {
+                String cur = readMirror();
+                // 二次校验：内容必须仍是默认、且没有 rev（说明没人保存过）
+                if (cur == null || revOf(cur) > 0L
+                        || !cur.trim().equals(defaultContent().trim())) {
+                    return;
+                }
+                writeMirror(conf);
+                mirrorIsDefault = false;
+                appendAudit("MIRROR migrate from conf rev=" + revOf(conf));
+            }
+        }, "antiburn-conf-migrate");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    /** 原子地取反 enable_status，返回新的 "1"/"0"；失败返回 null。供快捷磁贴使用，避免读改写竞态。 */
+    public static String flipStatus() {
+        synchronized (LOCK) {
+            String conf = read();
+            // 旧实现：读不到配置时把 on 当成 true，于是「第一次点磁贴」写进去的是 0，
+            // 用户以为点开了、实际是关掉。改为读不到时按「关闭」处理，首次点击必然是开启。
+            boolean on = false;
+            boolean known = false;
+            if (conf != null) {
+                for (String line : conf.split("\n")) {
+                    String t = line.trim();
+                    if (t.startsWith("enable_status=")) {
+                        on = t.substring(t.indexOf('=') + 1).trim().equals("1");
+                        known = true;
+                        break;
+                    }
+                }
+            }
+            String next = on ? "0" : "1";
+            appendAudit("TILE flip from=" + (known ? (on ? "1" : "0") : "unknown") + " to=" + next);
+            return update("enable_status", next) ? next : null;
+        }
+    }
+
+    /**
+     * 以「保留其它配置」的方式更新若干 key。
+     * updates 中 value 为 null 表示删除该 key（用于清理旧别名 blacklist）。
+     * 重复 key 只保留第一次出现的位置，注释行原样保留。
+     */
+    public static int updateEx(Map<String, String> updates) {
+        if (updates == null || updates.isEmpty()) {
+            return WRITE_FAILED;
+        }
+        synchronized (LOCK) {
+            // 基底必须完整：镜像缺失时先从旧 conf 迁移，绝不能用 defaultContent()
+            // 打底只叠加本次 diff（那会把用户其它所有设置静默重置）。
+            String content = ensureMirror();
+            StringBuilder sb = new StringBuilder();
+            Set<String> done = new HashSet<>();
+            for (String line : content.split("\n", -1)) {
+                String t = line.trim();
+                if (t.isEmpty()) {
+                    continue;
+                }
+                if (t.startsWith("#")) {
+                    sb.append(line).append('\n');
+                    continue;
+                }
+                int i = t.indexOf('=');
+                String key = (i < 0) ? t : t.substring(0, i).trim();
+                if (updates.containsKey(key)) {
+                    if (done.add(key)) {
+                        String v = updates.get(key);
+                        if (v != null) {
+                            sb.append(key).append('=').append(v).append('\n');
+                        }
+                    }
+                    // 同名重复行 / 旧别名行一律丢弃
+                } else {
+                    sb.append(line).append('\n');
+                }
+            }
+            for (Map.Entry<String, String> e : updates.entrySet()) {
+                if (!done.contains(e.getKey()) && e.getValue() != null) {
+                    sb.append(e.getKey()).append('=').append(e.getValue()).append('\n');
+                }
+            }
+            return writeEx(sb.toString(), describeChanges(updates));
+        }
+    }
+
+    /**
+     * 原子更新若干 key，并顺手删掉旧别名（如 blacklist）。
+     * 供 UI 侧「只写变化字段」使用：不再整表重建，避免把磁贴/其它页面刚写的值覆盖回去。
+     */
+    public static int updateExRemoving(Map<String, String> updates, Set<String> removeKeys) {
+        Map<String, String> m = new LinkedHashMap<>();
+        if (updates != null) {
+            m.putAll(updates);
+        }
+        if (removeKeys != null) {
+            for (String k : removeKeys) {
+                m.put(k, null); // value=null 在 updateEx 里表示删除该 key
+            }
+        }
+        return updateEx(m);
+    }
+
+    /** 更新单个 key。 */
+    public static boolean update(String key, String value) {
+        Map<String, String> m = new LinkedHashMap<>();
+        m.put(key, value);
+        return updateEx(m) != WRITE_FAILED;
+    }
+
+    /**
+     * 回读校验：确认刚写入的键值真的落在镜像里。
+     *
+     * <p>这是「显示已保存、实际没保存」的最后一道防线。文件写失败、fsync 没落地、
+     * 被其它进程覆盖，都会在这里暴露，而不是等用户下次打开发现开关又变回去了。
+     * 返回空集合才允许界面提示保存成功。
+     */
+    public static Set<String> verify(Map<String, String> expect) {
+        Set<String> bad = new HashSet<>();
+        if (expect == null || expect.isEmpty()) {
+            return bad;
+        }
+        String content = readMirror();
+        if (content == null) {
+            bad.addAll(expect.keySet());
+            return bad;
+        }
+        Map<String, String> actual = new LinkedHashMap<>();
+        for (String line : content.split("\n")) {
+            String t = line.trim();
+            if (t.isEmpty() || t.startsWith("#")) {
+                continue;
+            }
+            int i = t.indexOf('=');
+            if (i < 0) {
+                continue;
+            }
+            actual.put(t.substring(0, i).trim(), t.substring(i + 1).trim());
+        }
+        for (Map.Entry<String, String> e : expect.entrySet()) {
+            String want = e.getValue();
+            String got = actual.get(e.getKey());
+            if (want == null) {
+                if (got != null) {
+                    bad.add(e.getKey());
+                }
+            } else if (!want.equals(got)) {
+                bad.add(e.getKey());
+            }
+        }
+        return bad;
+    }
+
+    /**
+     * 准备共享目录（需要 root）：日志要落在用户能直接看到的位置。
+     *
+     * <p>Android 11+ 普通应用无法在 /sdcard/Android/ 下建目录，只能借 su；
+     * 同时把兜底目录设成 0777，保证 SystemUI(system uid) 也有地方可写。</p>
+     */
+    /**
+     * v2.9.4：被注入进程回传日志的 App 私有镜像路径。
+     * 只有 App 进程自己知道这个路径，导出时由 su（root 可读任意路径）合并进用户可见日志。
+     */
+    public static String hookLogFile() {
+        Context c = appCtx;
+        if (c == null) {
+            return null;
+        }
+        try {
+            return new File(c.getFilesDir(), ConfigProvider.HOOK_LOG_FILE).getAbsolutePath();
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    public static boolean prepareSharedDirs() {
+        // 路径含空格，必须整体加引号，否则 shell 会当成两个参数
+        String cmd = "mkdir -p \"" + LOG_DIR + "\" \"" + LOG_DIR_FALLBACK + "\" 2>/dev/null; "
+                + "chmod 0777 \"" + LOG_DIR + "\" \"" + LOG_DIR_FALLBACK + "\" 2>/dev/null; true";
+        return execSu(cmd);
+    }
+
+    /**
+     * 把兜底目录里的日志汇总到用户指定目录，返回写入结果描述。
+     * 用于「SystemUI 没有 /sdcard 写权限、只能写 /data/local/tmp」的设备。
+     */
+    /**
+     * 汇总日志到用户可见文件。
+     *
+     * <p>v2.5 修复三个可观测性 bug（真机日志直接证实）：
+     * ① 旧实现用 `>>` 把 audit 与兜底日志反复追加，每点一次「日志」就重复一批
+     *    WRITE/SAVE 行，且 audit 全部堆在正文前面，时间戳从几小时前跳到现在，
+     *    按行读会严重误判时序；
+     * ② 只收 LOG_DIR_FALLBACK/*.log，主目录里其它进程的日志收不到；
+     * ③ 没有上限，长期使用无限膨胀。
+     * 现在：收集全部来源 → 按行首时间戳排序 → 整行去重 → 只留最近 4000 行 →
+     * 写临时文件后原子覆盖，绝不重复追加。</p>
+     */
+    public static String exportLogs() {
+        File audit = auditFile();
+        String auditSrc = audit == null ? "" : " \"" + audit.getAbsolutePath() + "\"";
+        // v2.9.4：合并「注入进程日志镜像」。此前它写在 /sdcard/Android 下被分区存储
+        // 挡住、异常被吞，四个视频 App 的 ENTER/INJECTED/HOOK 一行都进不了导出日志。
+        // 现在由 App 进程写私有 files 目录，这里用 su 把它一起 cat 进来。
+        String hookSrc = hookLogFile();
+        String hookLogSrc = hookSrc == null ? "" : " \"" + hookSrc + "\"";
+        String cmd = "mkdir -p \"" + LOG_DIR + "\" 2>/dev/null; "
+                + "{ cat" + auditSrc + hookLogSrc
+                + " \"" + LOG_DIR + "\"/antiburn*.log"
+                + " \"" + LOG_DIR_FALLBACK + "\"/*.log"
+                + " \"" + LOG_FILE + "\" 2>/dev/null; } "
+                + "| grep -E '^[0-9]{10,}' "
+                // v2.8.2：过滤掉上一次导出追加的自检行，避免每点一次「日志」就多一条历史汇总
+                + "| grep -v '] SELF ver=' "
+                + "| sort -n -s -k1,1 "
+                + "| awk '!seen[$0]++' "
+                + "| tail -n 4000 > \"" + LOG_FILE + ".tmp\" 2>/dev/null; "
+                // 排序工具异常时宁可保留原日志，也不要把用户日志清空
+                + "if [ -s \"" + LOG_FILE + ".tmp\" ]; then "
+                + "mv -f \"" + LOG_FILE + ".tmp\" \"" + LOG_FILE + "\"; "
+                + "else rm -f \"" + LOG_FILE + ".tmp\"; fi 2>/dev/null; "
+                + "chmod 0666 \"" + LOG_FILE + "\" 2>/dev/null; "
+                + "wc -l \"" + LOG_FILE + "\" 2>/dev/null; true";
+        String out = execSuCapture(cmd);
+        supplementHookMirror();
+        appendSelfCheck();
+        return out == null ? "" : out.trim();
+    }
+
+    /**
+     * v2.8.2「改日志」：导出时追加一行自检汇总，把「模块到底注没注入视频 App」写死在日志里。
+     *
+     * <p>真机排障反复卡在同一处：用户说「抖音失效、快手只生效一次、B站只有右侧生效」，
+     * 但日志里只有 SystemUI 的 SYS 心跳，一条 INJECTED / HOOK-ATTACH / HOOK 都没有，
+     * 单看正文根本分不清是「没注入」「注入了没写日志」还是「开关没开」。现在导出时
+     * 直接统计各 App 的注入记录数并给出结论，不需要再靠猜：
+     *  - hook=NONE  → LSPosed 没把模块注入任何视频 App 进程，DouyinHook 整条链跑不到，
+     *                 真隐藏 100% 不生效；此时唯一能用的是无障碍「应用内区域兜底」；
+     *  - hook=alive → 真隐藏通道活着，再看 HOOK app= 里的 sw= / R= / T= / B= 定位
+     *                 是开关没开还是几何没扫到。</p>
+     */
+    private static void appendSelfCheck() {
+        try {
+            // v2.8.3：App 进程读不到 /storage/emulated/0/Android/... 时（分区存储），
+            // 退回 su cat。旧版只做直读，读失败就 return，SELF 因此从未出现。
+            String all = readAllLogs();
+            if (all.isEmpty()) {
+                return;
+            }
+            int dy = occurrences(all, "INJECTED Douyin")
+                    + occurrences(all, "HOOK-ATTACH pkg=com.ss.android");
+            int dr = occurrences(all, "INJECTED Drama")
+                    + occurrences(all, "HOOK-ATTACH pkg=com.phoenix.read");
+            int ks = occurrences(all, "INJECTED Kuaishou")
+                    + occurrences(all, "HOOK-ATTACH pkg=com.smile.gifmaker");
+            int bi = occurrences(all, "INJECTED Bilibili")
+                    + occurrences(all, "HOOK-ATTACH pkg=tv.danmaku.bili")
+                    + occurrences(all, "HOOK-ATTACH pkg=com.bilibili.app");
+            int hdiag = occurrences(all, "HOOK app=");
+            int mask = occurrences(all, "MASK ");
+            boolean injected = dy > 0 || dr > 0 || ks > 0 || bi > 0 || hdiag > 0;
+            // v3.0.23：共享日志只有 system uid 写得进；三方进程没 HOOK 行不等于没注入。
+            String lsp = LspScope.logHitsShort();
+            boolean lspHit = !"none".equals(lsp);
+            String hint = injected
+                    ? "hook=alive（各 App 真隐藏通道可用，继续看 HOOK app= 的 sw/R/T/B）"
+                    : lspHit
+                    ? "hook=NONE（共享日志里还没有 HOOK 行，但 LSPosed 日志已见命中：" + lsp
+                    + "；三方 App 写盘受限，不代表没加载）；处理：先强行停止该 App 再打开"
+                    : "hook=NONE（共享日志和 LSPosed 日志都还没采到视频 App 命中）；"
+                    + "处理：功能 › 通用 › 作用域自检，勾上打 ✗ 的 App → 强行停止该 App 再打开；"
+                    + "若是覆盖安装/更新了本模块：更新后第一次打开本应用会自动停止抖音/红果/快手/B站，"
+                    + "重新打开它们即重新注入，不用重启手机。";
+            int ovl = occurrences(all, "OVL on app=") + occurrences(all, "OVL window attached");
+            // v2.8.8：enter= 直接给出 handleLoadPackage 的命中进程。
+            // 以前要翻几百行才能确认「模块到底进没进抖音」，现在第一行就能判。
+            String enter = enterSummary(all);
+            String line = System.currentTimeMillis() + " [app/self] SELF ver="
+                    + BuildConfig.VERSION_NAME
+                    + " inject=douyin:" + dy + " drama:" + dr + " kuaishou:" + ks
+                    + " bilibili:" + bi + " hookdiag:" + hdiag + " mask:" + mask
+                    + " ovl:" + ovl
+                    // 盖黑通道已于 v2.8.6 在编译期拆除，这里恒 0。
+                    // v2.8.7 之前读的是镜像文件里的历史值，于是日志出现 app_overlay=1
+                    // 而实际生效的 ao=false，两者互相矛盾，把排查带偏过一轮。
+                    + " app_overlay=0"
+                    // v3.0.28：enter= 是历史累计，看不出一件事 —— 本轮到底注入了没有。
+                    // injAge 直接给「最后一次注入距今多久」，覆盖安装/杀进程后立刻能判。
+                    + " injAge=" + enterAges(all)
+                    + " enter=" + enter
+                    + " lsp=" + lsp
+                    + " " + hint;
+            appendRaw(line);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /**
+     * v2.8.3：把一行日志真正写进文件。
+     *
+     * <p>v2.8.2 的 SELF 自检为什么在真机日志里一条都没有：它用
+     * {@code new FileOutputStream(LOG_FILE, true)} 直写
+     * {@code /storage/emulated/0/Android/Prevent burn-in/antiburn.log}，
+     * App 进程没有这个目录的写权限（分区存储），异常又被 catch 吞掉，
+     * 于是「导出时追加自检」永远静默失败。这里改走 su 追加（base64 传输避免引号转义），
+     * su 不可用时才退回直写。</p>
+     */
+    private static boolean appendRaw(String line) {
+        if (line == null || line.isEmpty()) {
+            return false;
+        }
+        String payload = android.util.Base64.encodeToString(
+                (line + "\n").getBytes(java.nio.charset.StandardCharsets.UTF_8),
+                android.util.Base64.NO_WRAP);
+        String cmd = "mkdir -p \"" + LOG_DIR + "\" \"" + LOG_DIR_FALLBACK + "\" 2>/dev/null; "
+                + "echo " + payload + " | base64 -d "
+                + "| tee -a \"" + LOG_FILE + "\" "
+                + "| tee -a \"" + LOG_DIR_FALLBACK + "/antiburn.log\" >/dev/null 2>&1; true";
+        if (execSu(cmd)) {
+            return true;
+        }
+        long now = System.currentTimeMillis();
+        if (now < publicLogBlockedUntil) {
+            return false;
+        }
+        try (java.io.FileOutputStream fo = new java.io.FileOutputStream(LOG_FILE, true)) {
+            fo.write((line + "\n").getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            return true;
+        } catch (Throwable ignored) {
+            publicLogBlockedUntil = now + PUBLIC_LOG_BLOCK_MS;
+            return false;
+        }
+    }
+
+    /**
+     * v3.0.25：把已经拼好的整行（可含换行，例如崩溃堆栈）追加进共享日志。
+     *
+     * <p>返回是否写成功。崩溃回放必须知道结果：旧版回放走分区存储直写，
+     * 失败却照样删掉 pending 文件，于是「下次启动回放崩溃」永远看不到任何堆栈。</p>
+     */
+    public static boolean appendRawLine(String line) {
+        return appendRaw(line);
+    }
+
+    /**
+     * v3.2.16：被注入进程交回的日志行，**直接落进用户可见的 antiburn.log**。
+     *
+     * <p>真机实锤：用户从文件管理器直接捞 {@code /sdcard/Android/Prevent burn-in/antiburn.log}，
+     * 里面只有本模块自己写的 SYS / MASK / CONF 行 —— 视频 App 的 ENTER / INJECTED / RDUMP / BDUMP
+     * 全在私有镜像里，只有点「导出」或常驻服务 180 秒补录一次才会被并进来。
+     * 于是每份日志都「看起来没注入」，实际注入一直是好的。</p>
+     *
+     * <p>本进程（模块自身）对这个文件是有写权限的（目录 0777 / 文件 0666，早先建好），
+     * 所以 Provider 收到行就地追加即可：不 fork su、不等导出、不依赖常驻服务。
+     * 写不进去时返回 false，调用方退回私有镜像，导出时照样合并，不丢行。</p>
+     */
+    public static boolean appendHookLine(String line) {
+        if (line == null || line.isEmpty()) {
+            return false;
+        }
+        return appendDirectText(line + "\n");
+    }
+
+    /**
+     * v3.2.16：**不借 su、不等导出**，本进程直接把文本追加进公共日志。
+     *
+     * <p>公共目录是 su 时期建好并放开过权限的（0777 / 0666），模块自己写它是够的；
+     * 这也正是 MASK 心跳一直能落盘的原因。凡是「本进程能写」的行都走这里，
+     * 只有真的写不进去才退回镜像与 su —— 旧版把顺序做反了，su 一被拒就整批丢。</p>
+     *
+     * <p>超过 512KB 先 rename 成 .1，与 XposedInit 的轮转口径一致。</p>
+     */
+    public static boolean appendDirectText(String text) {
+        if (text == null || text.isEmpty()) {
+            return false;
+        }
+        long now = System.currentTimeMillis();
+        if (now >= publicLogBlockedUntil && writeDirect(LOG_FILE, text)) {
+            return true;
+        }
+        if (now >= publicLogBlockedUntil) {
+            // 直写失败（通常是注入进程没有 /sdcard/Android 的分区存储授权）；
+            // 先记下退避窗口，再走 su / 私有镜像，避免下一行继续撞 MediaProvider。
+            publicLogBlockedUntil = now + PUBLIC_LOG_BLOCK_MS;
+        }
+        return suAppend(text);
+    }
+
+    /** 单次直写；超过轮转阈值先改名成 .1。成功返回 true，任何异常都当失败。 */
+    private static boolean writeDirect(String path, String text) {
+        try {
+            File f = new File(path);
+            if (f.length() > LOG_ROTATE_BYTES) {
+                //noinspection ResultOfMethodCallIgnored
+                f.renameTo(new File(path + ".1"));
+            }
+            try (FileOutputStream fo = new FileOutputStream(f, true)) {
+                fo.write(text.getBytes(StandardCharsets.UTF_8));
+            }
+            return true;
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    /**
+     * v3.2.17：su 追加兜底。只在本进程直写失败时调用，且 10 秒最多一次；
+     * 两个目录都补一份（兜底目录保证有，用户目录方便直接取）。
+     * 命令结尾 {@code ; true} 让 execSu 恒成功，但这里不把它当回写条件。
+     */
+    private static boolean suAppend(String text) {
+        long now = System.currentTimeMillis();
+        if (now - lastSuAppendAt < SU_APPEND_INTERVAL_MS) {
+            return false;
+        }
+        lastSuAppendAt = now;
+        try {
+            String b64 = Base64.encodeToString(text.getBytes(StandardCharsets.UTF_8), Base64.NO_WRAP);
+            return execSu("mkdir -p \"" + LOG_DIR + "\" \"" + LOG_DIR_FALLBACK + "\" 2>/dev/null; "
+                    + "echo " + b64 + " | base64 -d | tee -a \"" + LOG_FILE + "\" "
+                    + "| tee -a \"" + LOG_DIR_FALLBACK + "/antiburn.log\" >/dev/null 2>&1; true");
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    /**
+     * v3.2.13 观测性兜底：部分 HyperOS 上 su 读应用私有 files 目录被 SELinux 拦掉，
+     * exportLogs 命令里的 {@code cat <私有镜像>} 静默失败，公开日志只剩 SystemUI 心跳；
+     * 本进程直读镜像却成功（{@link #readHookMirror()}），于是 SELF 能数出注入次数，
+     * 正文却看不到 ENTER/INJECTED/RDUMP/BDUMP 明细。这里在 su 合并之后，用本进程
+     * 直读镜像把 su 没带出来的行批量补进公开日志；整行去重、只追加，绝不回写镜像。
+     */
+    private static void supplementHookMirror() {
+        try {
+            String mirror = readHookMirror();
+            if (mirror == null || mirror.isEmpty()) {
+                return;
+            }
+            Set<String> seen = new HashSet<>();
+            String existing = readPublicLogDirect();
+            if (existing != null) {
+                for (String l : existing.split("\\r?\\n")) {
+                    if (!l.isEmpty()) {
+                        seen.add(l);
+                    }
+                }
+            }
+            StringBuilder missing = new StringBuilder();
+            for (String line : mirror.split("\\r?\\n")) {
+                if (line.isEmpty() || !seen.add(line)) {
+                    continue;
+                }
+                if (!line.matches("[0-9]{10,}.*")) {
+                    continue;
+                }
+                if (line.contains("] SELF ver=")) {
+                    continue;
+                }
+                missing.append(line).append('\n');
+            }
+            if (missing.length() == 0) {
+                return;
+            }
+            byte[] bytes = missing.toString().getBytes(StandardCharsets.UTF_8);
+            // v3.2.14：先直写。目录在 prepareSharedDirs 里已 chmod 0777、日志文件 0666，
+            // 本进程追加不需要 su —— 这样常驻服务可以低频补录而不 fork 任何进程。
+            boolean directOk = false;
+            try (FileOutputStream fo = new FileOutputStream(LOG_FILE, true)) {
+                fo.write(bytes);
+                directOk = true;
+            } catch (Throwable ignored) {
+                // 权限被系统收回去时退回 su
+            }
+            if (directOk) {
+                return;
+            }
+            String payload = Base64.encodeToString(bytes, Base64.NO_WRAP);
+            String cmd = "mkdir -p \"" + LOG_DIR + "\" \"" + LOG_DIR_FALLBACK + "\" 2>/dev/null; "
+                    + "echo " + payload + " | base64 -d "
+                    + "| tee -a \"" + LOG_FILE + "\" "
+                    + "| tee -a \"" + LOG_DIR_FALLBACK + "/antiburn.log\" >/dev/null 2>&1; true";
+            execSu(cmd);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /**
+     * v3.2.14：常驻服务用的静默补录。
+     *
+     * <p>用户反馈「每次都点一下导出按钮才知道日志好没好」——真正要的不是按钮，
+     * 而是 {@code antiburn.log} 自己就是最新的。这里只做一件事：把镜像里还没进
+     * 公开日志的行补进去，不写 SELF、不重排、不弹任何提示。</p>
+     *
+     * <p>成本控制：读自己的私有文件，没有新行就直接 return（常态零开销）；
+     * 有新行时优先本进程直写，一次 {@code write()} 就结束，不 fork su。
+     * 受「诊断日志」开关门控 —— 开关关着就完全不干活。</p>
+     */
+    public static void autoSyncLog() {
+        try {
+            if (!Config.enableLog) {
+                return;
+            }
+        } catch (Throwable ignored) {
+            // 配置还没加载好时按「不开」处理，绝不在后台凭空写盘
+            return;
+        }
+        try {
+            String mirror = readHookMirror();
+            if (mirror == null || mirror.isEmpty()) {
+                return;
+            }
+            supplementHookMirror();
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /** 直读当前公开日志（本进程）；读不到再走 su 兜底，供镜像补录做整行去重比对。 */
+    /**
+     * v3.4.0：给「上传到云端」用的日志快照。
+     *
+     * <p><b>修的是什么 bug</b>：上传走的是 {@code LogUploader.collectLog()}，它只读
+     * 配置镜像 {@link #readMirror()} 与公共 {@code antiburn.log}。前者是配置快照
+     * （{@code rev= / enable_...}），后一条路径在应用进程里往往读不到
+     * （分区存储拦着，只能靠 su）。真机上持续上传上来的都是 900 多字符的「纯配置」，
+     * 一条 {@code SYS / MASK / NDUMP / INJECTED} 都没有 —— 远端排查等于没有证据。
+     * 3.3.1/3.3.2 那两轮通知栏问题就是卡在这里：日志里看不到一句话。</p>
+     *
+     * <p>这里把三份来源合起来（本进程直读，不依赖 su）：注入进程镜像
+     * {@link #readHookMirror()}、公共日志 {@link #readPublicLogDirect()}、写盘审计
+     * {@link #auditFile()}，按行首时间戳排序、整行去重，只留最近 4000 行，
+     * 配置快照单独放在最前面并加 {@code [config]} 头。</p>
+     */
+    public static String uploadLogText() {
+        StringBuilder out = new StringBuilder();
+        try {
+            String cfg = readMirror();
+            if (cfg != null && !cfg.isEmpty()) {
+                out.append("[config]\n").append(cfg).append('\n');
+            }
+        } catch (Throwable ignored) {
+        }
+        java.util.Set<String> seen = new java.util.HashSet<>();
+        java.util.List<String> lines = new java.util.ArrayList<>();
+        addUploadLines(lines, seen, readPublicLogDirect());
+        addUploadLines(lines, seen, readHookMirror());
+        try {
+            File a = auditFile();
+            if (a != null && a.exists() && a.length() > 0) {
+                addUploadLines(lines, seen, readTextFile(a));
+            }
+        } catch (Throwable ignored) {
+        }
+        // 按行首时间戳稳定排序（毫秒/秒两种都按数值比），没有时间戳的行排在最后
+        lines.sort((x, y) -> Long.compare(leadTs(x), leadTs(y)));
+        if (lines.size() > 4000) {
+            lines = lines.subList(lines.size() - 4000, lines.size());
+        }
+        if (!lines.isEmpty()) {
+            out.append("[log]\n");
+            for (String l : lines) {
+                out.append(l).append('\n');
+            }
+        }
+        // v3.4.0-r2：探针 dump 单独成段。上一版只合并了 mirror / 公共日志 / 审计三份，
+        // VideoAppProbe 写的 antiburn_probe_*.log 是独立文件，云端从来没收到过一次
+        // View 树 —— 快手 / B站 的阈值标定就永远拿不到证据。这里把它并进上传，
+        // 但不参与上面的行排序与裁剪（树是整块结构，按行混排会碎掉）。
+        try {
+            String probe = readProbeDumps();
+            if (!probe.isEmpty()) {
+                out.append("[probe]\n").append(probe);
+            }
+        } catch (Throwable ignored) {
+        }
+        return out.toString();
+    }
+
+    /**
+     * 把目标 App 的探针 dump 读出来拼成一段。
+     *
+     * <p>文件由注入进程经 su 落到用户可见目录或兜底目录，应用进程直读经常被分区存储
+     * 拦掉，因此每个文件都按「用户目录 → 兜底目录 → /data/local/tmp」顺序试直读，
+     * 全失败再走一次 su cat。单文件上限 {@link #PROBE_MAX}，超长只留头部并标注，
+     * 避免把上传接口 120KB 的额度整段吃掉。</p>
+     */
+    private static String readProbeDumps() {
+        StringBuilder sb = new StringBuilder(8 * 1024);
+        for (String name : PROBE_FILES) {
+            String text = "";
+            for (String dir : new String[]{LOG_DIR, LOG_DIR_FALLBACK, "/data/local/tmp"}) {
+                try {
+                    File f = new File(dir, name);
+                    if (f.exists() && f.length() > 0) {
+                        text = readTextFile(f);
+                        break;
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+            if (text == null || text.isEmpty()) {
+                text = execSuCapture("cat \"" + LOG_DIR + "/" + name + "\" 2>/dev/null || "
+                        + "cat \"" + LOG_DIR_FALLBACK + "/" + name + "\" 2>/dev/null").trim();
+            }
+            if (text == null || text.isEmpty()) {
+                continue;
+            }
+            boolean cut = text.length() > PROBE_MAX;
+            if (cut) {
+                text = text.substring(0, PROBE_MAX);
+            }
+            sb.append("@@ ").append(name).append(" bytes=").append(text.length())
+                    .append(cut ? " truncated=1" : " truncated=0").append('\n');
+            sb.append(text);
+            if (!text.endsWith("\n")) {
+                sb.append('\n');
+            }
+        }
+        return sb.toString();
+    }
+
+    /** 探针 dump 文件名：与 {@code VideoAppProbe.init()} 传入的 label 一一对应。 */
+    private static final String[] PROBE_FILES = {
+            "antiburn_probe_kuaishou.log",
+            "antiburn_probe_bilibili.log",
+    };
+    /** 单个探针 dump 进上传的最大字符数（预留余量给 [config] 与 [log] 两段）。 */
+    private static final int PROBE_MAX = 40_000;
+
+    private static void addUploadLines(java.util.List<String> into,
+                                       java.util.Set<String> seen, String text) {
+        if (text == null || text.isEmpty()) {
+            return;
+        }
+        for (String l : text.split("\\r?\\n")) {
+            if (l.isEmpty() || !seen.add(l)) {
+                continue;
+            }
+            if (l.contains("] SELF ver=")) {
+                continue; // 每次导出都会追加的汇总行，重复进来只会干扰时间线
+            }
+            into.add(l);
+        }
+    }
+
+    /** 行首时间戳（10 位以上的纯数字），用于排序；没有则视为 0（排最后）。 */
+    private static long leadTs(String line) {
+        int n = 0;
+        while (n < line.length() && n < 18 && Character.isDigit(line.charAt(n))) {
+            n++;
+        }
+        if (n < 10) {
+            return 0L;
+        }
+        try {
+            return Long.parseLong(line.substring(0, n));
+        } catch (Throwable t) {
+            return 0L;
+        }
+    }
+
+    private static String readTextFile(File f) {
+        try (java.io.BufferedReader br = new java.io.BufferedReader(new java.io.FileReader(f))) {
+            StringBuilder sb = new StringBuilder();
+            String line;
+            while ((line = br.readLine()) != null) {
+                sb.append(line).append('\n');
+            }
+            return sb.toString();
+        } catch (Throwable t) {
+            return "";
+        }
+    }
+
+    private static String readPublicLogDirect() {
+        try {
+            File f = new File(LOG_FILE);
+            if (f.exists() && f.length() > 0) {
+                StringBuilder sb = new StringBuilder();
+                try (java.io.BufferedReader br = new java.io.BufferedReader(
+                        new java.io.FileReader(f))) {
+                    String line;
+                    while ((line = br.readLine()) != null) {
+                        sb.append(line).append('\n');
+                    }
+                }
+                return sb.toString();
+            }
+        } catch (Throwable ignored) {
+        }
+        return execSuCapture("cat \"" + LOG_FILE + "\" 2>/dev/null; cat \""
+                + LOG_DIR_FALLBACK + "/antiburn.log\" 2>/dev/null");
+    }
+
+    /**
+     * v2.8.3：无障碍服务到底有没有开。
+     *
+     * <p>真机日志里连一条 {@code MASK} 都没有，说明服务从未连上 —— 但旧版日志
+     * 里没有任何字段能表达这件事，用户只能看到「兜底开关是开的、就是没反应」。
+     * 这里直接读系统设置，把结论写进日志。</p>
+     */
+    public static boolean a11yEnabled(android.content.Context ctx) {
+        try {
+            String s = android.provider.Settings.Secure.getString(
+                    ctx.getContentResolver(), "enabled_accessibility_services");
+            if (s == null || s.isEmpty()) {
+                return false;
+            }
+            String cls = BurnInMaskService.class.getName();
+            return s.contains(cls) || s.contains("io.github.wumisc.antiburn");
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /**
+     * v2.8.3：用 root 直接把本应用的无障碍服务写进系统设置。
+     *
+     * <p>真机日志连续多版零 {@code MASK} 行，说明无障碍服务从来没连上过 ——
+     * 用户手里其实一直有 root，只是没人告诉他要另外去设置里开一个开关。
+     * 这里用 {@code settings put secure enabled_accessibility_services} 直接开，
+     * 保留列表里其它应用的服务，只追加本应用这一项，并把 accessibilty_enabled 置 1。</p>
+     *
+     * <p>只影响本应用自己的服务，不改任何第三方应用；用户随时可在系统设置里关掉。</p>
+     */
+    public static boolean enableA11yByRoot(android.content.Context ctx) {
+        try {
+            if (ctx == null || !hasRoot()) {
+                return false;
+            }
+            String comp = ctx.getPackageName() + "/" + BurnInMaskService.class.getName();
+            String cur = execSuCapture("settings get secure enabled_accessibility_services");
+            String merged = mergeA11yList(cur, comp);
+            String cmd = "settings put secure enabled_accessibility_services '" + merged + "'; "
+                    + "settings put secure accessibility_enabled 1; true";
+            boolean ok = execSu(cmd);
+            appendRaw(System.currentTimeMillis() + " [app/self] A11Y "
+                    + (ok ? "auto-enabled" : "enable FAILED")
+                    + " svc=" + comp + " list=" + merged);
+            return ok;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /** 纯函数：把本应用服务并进已有的无障碍服务列表，去掉 "null" 与重复项。 */
+    static String mergeA11yList(String cur, String comp) {
+        java.util.LinkedHashSet<String> set = new java.util.LinkedHashSet<>();
+        if (cur != null) {
+            for (String p : cur.trim().split(":")) {
+                String t = p.trim();
+                if (!t.isEmpty() && !"null".equals(t)) {
+                    set.add(t);
+                }
+            }
+        }
+        set.add(comp);
+        StringBuilder sb = new StringBuilder();
+        for (String t : set) {
+            if (sb.length() > 0) {
+                sb.append(':');
+            }
+            sb.append(t);
+        }
+        return sb.toString();
+    }
+
+    /** v2.8.4：App 侧往日志里追加一行（带 [app/self] 前缀与时间戳）。 */
+    public static void logLine(String msg) {
+        if (msg == null || msg.isEmpty()) {
+            return;
+        }
+        appendRaw(System.currentTimeMillis() + " [app/self] " + msg);
+    }
+
+    /**
+     * v2.8.3：App 启动时写一次完整自检（SELF + A11Y）。
+     *
+     * <p>放在启动而不是只放在「导出日志」里，是因为用户抓日志往往直接把
+     * {@code antiburn.log} 拷走，根本不会点导出按钮，旧版的 SELF 就永远看不到。</p>
+     */
+    public static void logSelfCheck(android.content.Context ctx) {
+        try {
+            boolean a11y = a11yEnabled(ctx);
+            if (!a11y) {
+                // 有 root 就直接把服务开起来：这条通道没开，应用内兜底等于没装。
+                if (enableA11yByRoot(ctx)) {
+                    a11y = a11yEnabled(ctx);
+                }
+            }
+            appendRaw(System.currentTimeMillis() + " [app/self] A11Y enabled=" + (a11y ? 1 : 0)
+                    + " svc=" + (a11y ? "on" : "off")
+                    + (a11y ? "" : " hint=无障碍服务未开启，「应用内区域兜底」不会生效"));
+            appendSelfCheck();
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /**
+     * 读回整份日志。文件直接可读时走普通 IO，读不到再走 root ——
+     * 分区存储下 App 进程直写 {@code /storage/emulated/0/Android/data/...} 会被拦，
+     * 但读自己曾写入的路径通常没问题，两条路都留。
+     */
+    private static String readAllLogs() {
+        String base = "";
+        File f = new File(LOG_FILE);
+        try {
+            if (f.exists() && f.length() > 0) {
+                StringBuilder sb = new StringBuilder();
+                try (java.io.BufferedReader br = new java.io.BufferedReader(
+                        new java.io.FileReader(f))) {
+                    String line;
+                    while ((line = br.readLine()) != null) {
+                        sb.append(line).append('\n');
+                    }
+                }
+                if (sb.length() > 0) {
+                    base = sb.toString();
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        if (base.isEmpty()) {
+            String via = execSuCapture("cat \"" + LOG_FILE + "\" 2>/dev/null; "
+                    + "cat \"" + LOG_DIR_FALLBACK + "/antiburn.log\" 2>/dev/null");
+            base = via == null ? "" : via;
+        }
+        // v3.0.1：视频 App 直写公共目录失败时，ENTER/INJECTED/HOOK 只落在私有镜像里。
+        // 不读镜像 SELF 就会把 inject= 误报成 0、hook 误判成 NONE（真机日志已证实）。
+        // 只做读取聚合：整行去重、保持原有顺序，绝不写回任何原始日志。
+        return mergeUniqueLines(base, readHookMirror());
+    }
+
+    /**
+     * v3.0.1：读回注入进程经 Provider 回传的私有日志镜像（files/hook-injected.log）。
+     * 与 exportLogs() 的导出合并完全独立，这里只喂给 SELF / ENTER 统计，不改导出逻辑。
+     */
+    private static String readHookMirror() {
+        String path = hookLogFile();
+        if (path == null || path.isEmpty()) {
+            return "";
+        }
+        File f = new File(path);
+        try {
+            if (f.exists() && f.length() > 0) {
+                StringBuilder sb = new StringBuilder();
+                try (java.io.BufferedReader br = new java.io.BufferedReader(
+                        new java.io.FileReader(f))) {
+                    String line;
+                    while ((line = br.readLine()) != null) {
+                        sb.append(line).append('\n');
+                    }
+                }
+                return sb.toString();
+            }
+        } catch (Throwable ignored) {
+            // 直读失败再走 su：root 可读任意应用私有路径
+        }
+        String via = execSuCapture("cat \"" + path + "\" 2>/dev/null");
+        return via == null ? "" : via;
+    }
+
+    /** v3.0.1：按整行去重（等价于 awk '!seen[$0]++'），保留首次出现顺序。 */
+    private static String mergeUniqueLines(String... sources) {
+        java.util.LinkedHashSet<String> seen = new java.util.LinkedHashSet<>();
+        StringBuilder sb = new StringBuilder();
+        for (String src : sources) {
+            if (src == null || src.isEmpty()) {
+                continue;
+            }
+            for (String line : src.split("\\r?\\n")) {
+                if (!line.isEmpty() && seen.add(line)) {
+                    sb.append(line).append('\n');
+                }
+            }
+        }
+        return sb.toString();
+    }
+
+    /** v2.8.8：作用域自检复用同一份 ENTER 摘要。 */
+    static String enterHits() {
+        return enterSummary(readAllLogs());
+    }
+
+    /**
+     * v3.0.28：各视频 App「最后一次 ENTER」距今多久。
+     *
+     * <p>enter= 是历史累计，哪怕这轮进程压根没注入也照样显示 OK —— 真机上就出现过
+     * 「SELF 说注入 18 次、实际本轮一条 HOOK 都没有」。这里按日志行首毫秒时间戳
+     * 找最后一次命中，写成 douyin=3m / kuaishou=27m / never。</p>
+     */
+    static String enterAges(String all) {
+        long now = System.currentTimeMillis();
+        String[] names = {"douyin", "drama", "kuaishou", "bili"};
+        String[] pkgs = {"com.ss.android.ugc.aweme", "com.phoenix.read",
+                "com.smile.gifmaker", "com.bilibili"};
+        StringBuilder sb = new StringBuilder();
+        for (int k = 0; k < pkgs.length; k++) {
+            int at = all == null ? -1 : all.lastIndexOf("ENTER pkg=" + pkgs[k]);
+            long age = -1L;
+            if (at >= 0) {
+                int ls = all.lastIndexOf('\n', at) + 1;
+                int sp = all.indexOf(' ', ls);
+                if (sp > ls) {
+                    try {
+                        age = now - Long.parseLong(all.substring(ls, sp));
+                    } catch (Throwable ignored) {
+                        age = -1L;
+                    }
+                }
+            }
+            if (k > 0) {
+                sb.append('/');
+            }
+            sb.append(names[k]).append('=')
+                    .append(age < 0 ? "never" : (age / 60_000L) + "m");
+        }
+        return sb.toString();
+    }
+
+    /**
+     * v2.8.8：把日志里 {@code ENTER pkg=} 的命中压成短标签。
+     *
+     * <p>{@code ENTER} 是 {@code handleLoadPackage} 的第一行、走 {@code diagForce}，
+     * 只要 LSPosed 把模块加载进某个进程就一定会打这一行。以前要翻几百行日志才能确认
+     * 「模块到底进没进抖音」，现在每次启动写 SELF 时把命中包名一起带上，
+     * 第一行就能判：出现 {@code OK:com.ss.android.ugc.aweme} 才算注入通了。</p>
+     */
+    private static String enterSummary(String all) {
+        java.util.LinkedHashSet<String> hits = new java.util.LinkedHashSet<>();
+        String key = "ENTER pkg=";
+        int i = 0;
+        while (i < all.length()) {
+            int at = all.indexOf(key, i);
+            if (at < 0) {
+                break;
+            }
+            int s = at + key.length();
+            int e = s;
+            while (e < all.length()) {
+                char ch = all.charAt(e);
+                if (ch == ' ' || ch == '\n' || ch == '\r' || ch == '\t') {
+                    break;
+                }
+                e++;
+            }
+            String p = all.substring(s, e);
+            i = e;
+            if (p.isEmpty()) {
+                continue;
+            }
+            if ("com.android.systemui".equals(p)) {
+                hits.add("sysui");
+            } else if ("io.github.wumisc.antiburn".equals(p)) {
+                hits.add("self");
+            } else if ("system".equals(p)) {
+                hits.add("sys");
+            } else if (VideoApps.isTarget(p)) {
+                // 命中目标包说明这一步真过去了，标 OK 最醒目
+                hits.add("OK:" + p);
+            }
+        }
+        if (hits.isEmpty()) {
+            return "none";
+        }
+        StringBuilder sb = new StringBuilder();
+        for (String h : hits) {
+            if (sb.length() > 0) {
+                sb.append(',');
+            }
+            sb.append(h);
+        }
+        return sb.toString();
+    }
+
+    private static int occurrences(String s, String needle) {
+        int n = 0;
+        int i = 0;
+        while ((i = s.indexOf(needle, i)) >= 0) {
+            n++;
+            i += needle.length();
+        }
+        return n;
+    }
+
+    // ---- 名单模式（v2.8）----
+    // 语义唯一真源，Hook 侧 Config 与 App 侧 AbConf 都从这里取，不允许各自维护一份字符串。
+    //   white：名单内豁免（前台时不隐藏/不偏移），名单为空 = 全部应用都干预
+    //   black：名单内干预，名单为空 = 退回全部干预（避免用户切过去后以为模块失效）
+    //   off  ：不使用名单，所有应用都干预
+    public static final String MODE_WHITE = "white";
+    public static final String MODE_BLACK = "black";
+    public static final String MODE_OFF = "off";
+    public static final String KEY_MODE = "list_mode";
+    public static final String KEY_WHITE = "whitelist";
+    public static final String KEY_BLACK = "blacklist";
+
+    /** 未知值一律归到 white：与旧版（没有 mode 键）的行为一致，升级后语义不变。 */
+    public static String normMode(String v) {
+        if (v == null) {
+            return MODE_WHITE;
+        }
+        String t = v.trim().toLowerCase(java.util.Locale.ROOT);
+        if (MODE_BLACK.equals(t) || "blacklist".equals(t) || "黑名单".equals(t)) {
+            return MODE_BLACK;
+        }
+        if (MODE_OFF.equals(t) || "off_list".equals(t) || "关闭".equals(t)) {
+            return MODE_OFF;
+        }
+        return MODE_WHITE;
+    }
+
+    // ---- 运行引擎（v2.6）----
+    // 同一份 APK 里有两条互斥的实现路径，同一时刻只能有一条干活：
+    //   lsposed：在 SystemUI 进程里 Hook，真隐藏 + 像素微移，需要 root + LSPosed
+    //   overlay：无障碍覆盖层遮盖，免 root，只能「盖黑」不能隐藏、不能微移
+    // 默认 lsposed 是为了向后兼容：老用户升级后若突然切到 overlay，会与仍在跑的 Hook
+    // 叠加成双重干预（状态栏既被隐藏又被盖一条黑边）。
+    public static final String ENGINE_LSPOSED = "lsposed";
+    public static final String ENGINE_OVERLAY = "overlay";
+    public static final String KEY_ENGINE = "engine";
+
+    /** 未知值一律按 lsposed 解释：缺这个键的旧配置必须保持原行为。 */
+    public static String normEngine(String v) {
+        if (v == null) {
+            return ENGINE_LSPOSED;
+        }
+        String t = v.trim().toLowerCase(java.util.Locale.ROOT);
+        if (ENGINE_OVERLAY.equals(t) || "a11y".equals(t) || "accessibility".equals(t)
+                || "无障碍".equals(t) || "遮盖".equals(t)) {
+            return ENGINE_OVERLAY;
+        }
+        return ENGINE_LSPOSED;
+    }
+
+    /** 一份配置里「模式 + 两份名单」的一次性解析结果。 */
+    public static final class Lists {
+        public String mode = MODE_WHITE;
+        public final Set<String> white = new LinkedHashSet<>();
+        public final Set<String> black = new LinkedHashSet<>();
+
+        /** 当前模式真正生效的那份名单；off 模式下调用方按「不干预过滤」处理。 */
+        public Set<String> active() {
+            return MODE_BLACK.equals(mode) ? black : white;
+        }
+    }
+
+    /**
+     * 解析 list_mode / whitelist / blacklist 三键。
+     *
+     * <p>兼容旧配置：没有 list_mode 时按 white 解释；若既没有 list_mode 也没有
+     * whitelist、只有旧别名 blacklist，则把它当作白名单迁移过来 —— 这正是 v2.7
+     * 及更早版本的实际行为，保证升级后名单效果不变。</p>
+     */
+    public static Lists readLists(String content) {
+        Lists out = new Lists();
+        if (content == null) {
+            return out;
+        }
+        boolean modePresent = false;
+        boolean whitePresent = false;
+        boolean blackPresent = false;
+        Set<String> w = new LinkedHashSet<>();
+        Set<String> b = new LinkedHashSet<>();
+        for (String line : content.split("\n")) {
+            String t = line.trim();
+            if (t.isEmpty() || t.startsWith("#")) {
+                continue;
+            }
+            int i = t.indexOf('=');
+            if (i < 0) {
+                continue;
+            }
+            String k = t.substring(0, i).trim();
+            String v = t.substring(i + 1).trim();
+            if (KEY_MODE.equals(k)) {
+                out.mode = normMode(v);
+                modePresent = true;
+            } else if (KEY_WHITE.equals(k)) {
+                whitePresent = true;
+                w.addAll(parseWhitelist(v));
+            } else if (KEY_BLACK.equals(k)) {
+                blackPresent = true;
+                b.addAll(parseWhitelist(v));
+            }
+        }
+        out.white.addAll(w);
+        out.black.addAll(b);
+        if (!modePresent && !whitePresent && blackPresent) {
+            out.white.clear();
+            out.white.addAll(b);
+            out.black.clear();
+        }
+        return out;
+    }
+
+    /**
+     * 原子写「模式 + 两份名单」。
+     *
+     * <p>三者必须在同一次 updateEx 里落盘：分成两次写会出现「模式已切到黑名单、
+     * 名单行还是旧白名单内容」的中间态，那一刻名单语义整体反向。conf 不存在时
+     * 自动生成默认配置，解决「第一次打开名单页永远保存失败」。</p>
+     */
+    public static boolean replaceList(String mode, Set<String> white, Set<String> black) {
+        Map<String, String> m = new LinkedHashMap<>();
+        m.put(KEY_MODE, normMode(mode));
+        m.put(KEY_WHITE, join(white));
+        m.put(KEY_BLACK, join(black));
+        return updateEx(m) != WRITE_FAILED;
+    }
+
+    /** 只改指定模式那一份名单，另一份原样保留；模式与两份名单仍同批写入。 */
+    public static boolean replaceListOne(String mode, Set<String> set) {
+        // 「读另一半 → 合并 → 写回」必须整体持锁：否则在这中间有别的入口
+        // （磁贴 / 另一个页面 / 上一轮 save）写入时，会把对方刚写的名单覆盖掉。
+        // updateEx 内部也锁 LOCK，Java 的 synchronized 可重入，不会自锁。
+        synchronized (LOCK) {
+            Lists cur = readLists(ensureMirror());
+            Set<String> w = new LinkedHashSet<>(cur.white);
+            Set<String> b = new LinkedHashSet<>(cur.black);
+            Set<String> v = set == null ? new LinkedHashSet<>() : new LinkedHashSet<>(set);
+            if (MODE_BLACK.equals(normMode(mode))) {
+                b = v;
+            } else {
+                w = v;
+            }
+            return replaceList(normMode(mode), w, b);
+        }
+    }
+
+    /**
+     * 解析名单文本为去重、去空白的包名集合。
+     *
+     * <p>分隔符认中文逗号与中英文分号，与 {@code Config.parse} 保持一致：
+     * 两侧必须用同一套规则，否则会出现「界面里存好了、模块侧解析不出来」的不一致。</p>
+     */
+    public static Set<String> parseWhitelist(String text) {
+        Set<String> set = new LinkedHashSet<>();
+        if (text != null) {
+            for (String p : text.split("[,，;；]")) {
+                p = p.trim();
+                if (!p.isEmpty()) {
+                    set.add(p);
+                }
+            }
+        }
+        return set;
+    }
+
+    private static String join(Set<String> set) {
+        StringBuilder sb = new StringBuilder();
+        for (String p : set) {
+            if (p == null || p.trim().isEmpty()) {
+                continue;
+            }
+            if (sb.length() > 0) {
+                sb.append(',');
+            }
+            sb.append(p.trim());
+        }
+        return sb.toString();
+    }
+
+    /** 多行值编码成单行：\ → \\，换行 → \n（字面两字符）。 */
+    public static String encodeValue(String s) {
+        if (s == null) {
+            return "";
+        }
+        return s.replace("\r", "")
+                .replace("\\", "\\\\")
+                .replace("\n", "\\n");
+    }
+
+    /** 与 encodeValue 对应的解码。 */
+    public static String decodeValue(String s) {
+        if (s == null || s.isEmpty()) {
+            return "";
+        }
+        StringBuilder out = new StringBuilder();
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c == '\\' && i + 1 < s.length()) {
+                char n = s.charAt(++i);
+                if (n == 'n') {
+                    out.append('\n');
+                } else if (n == '\\') {
+                    out.append('\\');
+                } else {
+                    out.append('\\').append(n);
+                }
+            } else {
+                out.append(c);
+            }
+        }
+        return out.toString();
+    }
+
+    /**
+     * 检测 root 是否可用（供界面显示状态）。会阻塞，务必在 IO 线程调用。
+     * 结果缓存 60s：界面每次重组都 fork 一次 su 是纯浪费，且会拖慢首屏。
+     */
+    public static boolean hasRoot() {
+        long now = System.currentTimeMillis();
+        // 成功后缓存 60s（环境不会突变），失败只缓存 10s：root 授权是用户点弹窗的
+        // 异步动作，缓存 60s 会让他点完「允许」还要干等一分钟才看到状态变化。
+        long ttl = rootCached ? 60_000L : 10_000L;
+        if (rootCheckedAt != 0L && now - rootCheckedAt < ttl) {
+            return rootCached;
+        }
+        String uid = execSuCapture("id -u 2>/dev/null", 8_000L);
+        boolean ok = uid != null && uid.trim().startsWith("0");
+        rootCheckedAt = now;
+        rootCached = ok;
+        return ok;
+    }
+
+    /** 让界面上的「重新检测」能立刻作废缓存，不用等 TTL 到期。 */
+    public static void invalidateRootCache() {
+        rootCheckedAt = 0L;
+        rootCached = false;
+    }
+
+    /**
+     * 重启 SystemUI，让刚保存的配置立刻重新注入生效。
+     * SystemUI 是 persistent 进程，被 kill 后系统会立刻自动拉起，状态栏会短暂重绘。
+     *
+     * 用 pkill -f 搭配「方括号正则」：命令行里写的是 com[.]android[.]systemui，
+     * 正则能匹配进程名 com.android.systemui，但字符串本身不含该明文，
+     * 因此不会把执行这条命令的 su shell 自己也杀掉（经典自杀陷阱）。
+     * killall 按 comm 匹配（内核截断 15 字符），只作为没有 pkill 的 ROM 的兜底。
+     * 不用 am force-stop：会把 SystemUI 置为 stopped 状态，反而可能不自动恢复。
+     */
+    public static boolean restartSystemUi() {
+        String[] cmds = {
+                "pkill -f 'com[.]android[.]systemui' 2>/dev/null",
+                "killall com.android.systemui 2>/dev/null",
+        };
+        for (String cmd : cmds) {
+            if (execSu(cmd)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 执行写 / 重启类命令：超时或异常时**不重跑整条命令**。
+     * 旧实现会走 tryAltSu 再执行一遍，`pkill -f` 这类非幂等命令会把 SystemUI 杀两次。
+     */
+    public static boolean execSu(String cmd) {
+        return runSu("su", cmd, false) != null;
+    }
+
+    /**
+     * 执行 su 命令并返回 stdout（退出码非 0 / 超时 / 无 root 返回 null）。
+     * 独立线程消费 stdout + stderr，避免未读流把 su 进程缓冲区塞满而卡死。
+     */
+    public static String execSuCapture(String cmd) {
+        return execSuCapture(cmd, 4_000L);
+    }
+
+    /**
+     * 带超时的 su 执行。
+     *
+     * <p>默认 4s 对「读一个文件」够用，但 root 授权弹窗要等人点，4s 常常不够 ——
+     * 超时后 destroy 会把 KernelSU/Magisk 的授权请求一起掐掉，用户点完「允许」
+     * 界面依旧是「无 root」。root 探测走 8s，就是为了让弹窗有时间被人看见。</p>
+     */
+    public static String execSuCapture(String cmd, long timeoutMs) {
+        return runSu("su", cmd, true, timeoutMs);
+    }
+
+    private static String runSu(String suPath, String cmd, boolean allowRetry) {
+        return runSu(suPath, cmd, allowRetry, 4_000L);
+    }
+
+    private static String runSu(String suPath, String cmd, boolean allowRetry, long timeoutMs) {
+        Process p = null;
+        final ByteArrayOutputStream out = new ByteArrayOutputStream();
+        try {
+            p = Runtime.getRuntime().exec(new String[]{suPath, "-c", cmd});
+            final Process fp = p;
+            Thread so = new Thread(() -> {
+                try (InputStream is = fp.getInputStream()) {
+                    byte[] buf = new byte[4096];
+                    int n;
+                    while ((n = is.read(buf)) > 0) {
+                        out.write(buf, 0, n);
+                    }
+                } catch (Throwable ignore) {
+                }
+            });
+            so.setDaemon(true);
+            so.start();
+            Thread se = new Thread(() -> {
+                try (InputStream is = fp.getErrorStream()) {
+                    byte[] buf = new byte[4096];
+                    while (is.read(buf) > 0) {
+                        // discard
+                    }
+                } catch (Throwable ignore) {
+                }
+            });
+            se.setDaemon(true);
+            se.start();
+            if (!p.waitFor(timeoutMs, TimeUnit.MILLISECONDS)) {
+                p.destroy();
+                return allowRetry ? tryAltSu(suPath, cmd) : null;
+            }
+            so.join(1500);
+            se.join(500);
+            if (p.exitValue() != 0) {
+                return null;
+            }
+            return new String(out.toByteArray(), StandardCharsets.UTF_8);
+        } catch (Throwable t) {
+            if (p != null) {
+                try {
+                    p.destroy();
+                } catch (Throwable ignore) {
+                }
+            }
+            return allowRetry ? tryAltSu(suPath, cmd) : null;
+        }
+    }
+
+    /** 少数 ROM 的 app 进程 PATH 里没有 su，补几个常见绝对路径；仅首次调用时递归一层。 */
+    private static String tryAltSu(String suPath, String cmd) {
+        if (!"su".equals(suPath)) {
+            return null;
+        }
+        String[] alts = {
+                "/system/bin/su", "/system/xbin/su",
+                "/sbin/su", "/debug_ramdisk/su",
+        };
+        for (String alt : alts) {
+            if (new File(alt).exists()) {
+                String r = runSu(alt, cmd, false, 8_000L);
+                if (r != null) {
+                    return r;
+                }
+            }
+        }
+        return null;
+    }
+}

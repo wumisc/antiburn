@@ -1,0 +1,446 @@
+package io.github.wumisc.antiburn;
+
+import android.os.Process;
+import android.util.Base64;
+import android.util.Log;
+
+import java.io.File;
+import java.io.FileOutputStream;
+import java.nio.charset.StandardCharsets;
+
+import io.github.wumisc.antiburn.compat.IXposedHookLoadPackage;
+import io.github.wumisc.antiburn.compat.XposedBridge;
+import io.github.wumisc.antiburn.compat.callbacks.XC_LoadPackage;
+
+/**
+ * LSPosed 模块入口
+ *  - com.android.systemui：状态栏 / 导航栏周期透明化
+ *  - com.ss.android.ugc.aweme（抖音）：视频页各区域周期透明化
+ *  - com.phoenix.read*（红果短剧）：复用抖音区域逻辑，另含「左滑查看详情」文本识别
+ *  - com.smile.gifmaker（快手）、tv.danmaku.bili（B站）：v2.6.8 正式接入，
+ *    由 DouyinHook 复用几何识别做周期隐藏（受各自总开关 + 共用区域开关门控），
+ *    同时保留 VideoAppProbe 在诊断日志开启时导出 View 树，供真机阈值精调
+ *
+ * v2.0.1 日志修复：
+ *  1. 旧版 diag() 第一行就是 `if (!Config.enableLog) return;`，而 Config.enableLog 默认 false、
+ *     又依赖配置链路正常工作 —— 一旦「保存不住」读不到配置，日志就一条都没有，
+ *     连「模块到底有没有注入」都无法判断。现在关键事件走 diagForce()，不受开关影响。
+ *  2. 旧版只会写 /sdcard/Download。SystemUI（system uid）能写，抖音/红果是普通 app，
+ *     Android 10+ 分区存储必然失败，退回 Log 后 logcat 又被限流，等于没有日志。
+ *     现在探测一次可写路径并缓存；非 system 进程再经 su 低频落盘到 /data/local/tmp。
+ *  3. 日志文件加 512KB 上限，超限自动轮转为 .1，避免长期开启撑爆存储。
+ */
+public class XposedInit implements IXposedHookLoadPackage {
+
+    public static final String TAG = "Antiburn";
+
+    /** 单个诊断日志上限，超过后轮转为 .1 重新写，避免常年开启撑爆存储 */
+    private static final long MAX_LOG_BYTES = 512 * 1024L;
+    /**
+     * 诊断日志候选路径，按优先级探测。
+     *
+     * <p>首选用户指定的 /storage/emulated/0/Android/Prevent burn-in/：这个目录 App 侧
+     * 会用 su 预建并放开权限，SystemUI 能直接写；随后是 /data/local/tmp 兜底目录。
+     * 注意这里存的是「目录」，具体文件名在 {@link #writeNow} 里拼。</p>
+     */
+    private static final String[] LOG_PATHS = {
+            ConfStore.LOG_DIR + "/antiburn.log",
+            "/sdcard/Android/Prevent burn-in/antiburn.log",
+            ConfStore.LOG_DIR_FALLBACK + "/antiburn.log",
+            // v2.5：旧版第 4 候选是 /data/local/tmp/antiburn_diag.log，
+            // 但 exportLogs() 只收 LOG_DIR_FALLBACK/*.log，这个文件永远导不出来。
+            ConfStore.LOG_DIR_FALLBACK + "/antiburn_diag.log",
+    };
+    /** 探测失败后的冷却时间：过了这段时间允许重探（App 可能刚把目录建好） */
+    private static final long PROBE_RETRY_MS = 30_000L;
+    /** 非 system 进程经 su 落盘的最小间隔，避免每次 tick 都 fork 一个 su */
+    private static final long SU_WRITE_INTERVAL_MS = 10_000L;
+
+    private static volatile String logPath;
+    private static volatile boolean probed = false;
+    /** 上次探测全部失败的时间戳；超过冷却期允许重探（App 可能刚建好目录） */
+    private static volatile long probeFailAt = 0L;
+    private static volatile long lastSuWrite = 0L;
+    /** 上次经 Provider 回传日志的时间（v2.9.1：普通行 5 秒节流，关键行不限） */
+    private static volatile long lastProviderAt = 0L;
+    private static final long PROVIDER_LOG_INTERVAL_MS = 5_000L;
+
+    /**
+     * 写日志用的单线程：Controller.tick() 跑在 SystemUI 主线程，旧版 diag() 直接同步 fopen/fwrite，
+     * 等于每 5 秒在主线程做一次文件 IO。改成异步串行写，主线程只入队。
+     * 队列上限 512 条，超出直接丢弃（诊断日志不值得为它拖垮 SystemUI）。
+     */
+    private static final java.util.concurrent.ExecutorService LOG_WRITER =
+            java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+                Thread t = new Thread(r, "antiburn-diag-writer");
+                t.setDaemon(true);
+                return t;
+            });
+    private static final java.util.concurrent.atomic.AtomicInteger QUEUED =
+            new java.util.concurrent.atomic.AtomicInteger(0);
+
+    /**
+     * 关键事件（注入成功 / 初始化异常）：始终落盘，不受「诊断日志」开关控制。
+     * 这是判断「模块有没有被注入」的唯一依据，不能被配置链路故障连带弄丢。
+     */
+    /**
+     * 热重载退役：关掉旧一代的日志写线程。
+     *
+     * <p>{@code newSingleThreadExecutor} 的常驻线程不会自己消失，每热重载一次就多一条
+     * 永不退出的线程 + 一个旧类加载器引用（整个模块的类都回收不掉）。</p>
+     */
+    static void stopForReload() {
+        try {
+            LOG_WRITER.shutdownNow();
+        } catch (Throwable ignored) {
+        }
+    }
+
+    public static void diagForce(String s) {
+        // v2.8.0：关键事件（注入 / HOOK 状态）在视频 App 进程里常常只能靠 su 兜底落盘，
+        // 旧版和 diag() 共用 10s 节流，注入日志会与紧随其后的事件挤在同一窗口被吞掉，
+        // 表现为「日志里一条 INJECTED Douyin 都没有」。force=true 跳过节流。
+        write(s, true);
+    }
+
+    /**
+     * 详细日志（周期状态 / 白名单命中 / 控件捕获）：受设置界面「诊断日志」开关控制。
+     */
+    public static void diag(String s) {
+        try {
+            if (!Config.enableLog) {
+                return;
+            }
+        } catch (Throwable ignored) {
+            // Config 未初始化时按开启处理
+        }
+        write(s, false);
+    }
+
+    private static void write(String s, boolean force) {
+        if (QUEUED.get() > 512) {
+            return; // 写盘严重滞后时丢弃，绝不阻塞调用线程
+        }
+        // 线程名必须在调用点取，异步写线程里拿到的只有 "antiburn-diag-writer"
+        final String origin = Process.myPid() + "/" + Thread.currentThread().getName();
+        QUEUED.incrementAndGet();
+        try {
+            LOG_WRITER.execute(() -> {
+                try {
+                    writeNow(origin, s, force);
+                } finally {
+                    QUEUED.decrementAndGet();
+                }
+            });
+        } catch (Throwable t) {
+            // 执行器已被退役（SelfReload / 热重载）：这条日志直接丢，绝不把调用方带走
+            QUEUED.decrementAndGet();
+            Log.i(TAG, "DIAG " + s);
+        }
+    }
+
+    private static void writeNow(String origin, String s, boolean force) {
+        String line = System.currentTimeMillis() + " [" + origin + "] " + s + "\n";
+        String path = logPath();
+        boolean directOk = false;
+        if (path != null) {
+            try {
+                File f = new File(path);
+                if (f.length() > MAX_LOG_BYTES) {
+                    // v2.5：不再先 delete 旧备份再 rename。多进程（SystemUI/抖音/红果）
+                    // 同时轮转时旧版会互相删掉对方刚生成的备份、丢失日志行。
+                    // rename 失败就继续 append，最多文件稍大，绝不丢行。
+                    File old = new File(path + ".1");
+                    //noinspection ResultOfMethodCallIgnored
+                    f.renameTo(old);
+                }
+                try (FileOutputStream fo = new FileOutputStream(f, true)) {
+                    fo.write(line.getBytes(StandardCharsets.UTF_8));
+                }
+                directOk = true;
+            } catch (Throwable ignored) {
+                // 路径突然不可写（存储卸载 / 权限变更）时落到下面的兜底
+            }
+        }
+        // v2.9.5「日志黑洞」真因（评审独立复核确认）：旧版在这里直接 `return;`，
+        // 直写成功的进程（模块自身 / SystemUI）永远执行不到函数尾部的 providerLog()，
+        // 与下面「回传统一放到下面」的注释自相矛盾。视频 App 进程直写通常失败、
+        // 能走到回传，但只要 logPath() 探测到任一可写路径就同样被短路。
+        // 现在改成标记 directOk：su 兜底只在直写失败时跑，Provider 回传无条件执行。
+        // 重复行由 ConfStore.exportLogs() 的 `awk '!seen[$0]++'` 整行去重，不会刷屏。
+        if (!directOk) {
+            Log.i(TAG, "DIAG " + s);
+            // 抖音 / 红果是普通 app，写不了 /sdcard；用 root 通道低频补一条，
+            // 保证「打开开关后仍然没有任何日志」这种事不再发生。
+            // v2.5：不再依赖 myUid()==SYSTEM_UID 判断。国产 ROM 的 SystemUI 未必是
+            // uid 1000，旧判断会让这些设备「直写失败后连 su 兜底都不试」，等于没有日志。
+            long now = System.currentTimeMillis();
+            if (force || now - lastSuWrite > SU_WRITE_INTERVAL_MS) {
+                lastSuWrite = now;
+                String b64 = Base64.encodeToString(
+                        line.getBytes(StandardCharsets.UTF_8), Base64.NO_WRAP);
+                // 两个目录都补一份：兜底目录保证一定有，用户目录方便直接取
+                ConfStore.execSu("mkdir -p \"" + ConfStore.LOG_DIR_FALLBACK + "\" \""
+                        + ConfStore.LOG_DIR + "\" 2>/dev/null; "
+                        + "echo " + b64 + " | base64 -d >> \"" + ConfStore.LOG_DIR_FALLBACK
+                        + "/antiburn.log\" 2>/dev/null; "
+                        + "echo " + b64 + " | base64 -d >> \"" + ConfStore.LOG_FILE
+                        + "\" 2>/dev/null; true");
+                // v2.9.1：su 命令结尾 `; true` 使 execSu 恒成功，不能再拿它当回传条件；
+                // 回传已移到下面，不看 suOk、也不受 10 秒 su 节流约束。
+            }
+        }
+        // 无条件回传：关键行（force）不限流，普通行 5 秒节流。
+        // 被注入进程把 ENTER / INJECTED / HOOK 交回 App 进程的 ConfigProvider，
+        // 落到私有 files/hook-injected.log，导出时由 su 合并进用户可见日志。
+        long nowForLog = System.currentTimeMillis();
+        if (force || nowForLog - lastProviderAt > PROVIDER_LOG_INTERVAL_MS) {
+            lastProviderAt = nowForLog;
+            providerLog(line);
+        }
+    }
+
+    /** 被注入进程拿不到 su 时，把日志行交回 App 进程的 ConfigProvider 写入。 */
+    private static void providerLog(final String line) {
+        providerLog(line, 0);
+    }
+
+    /**
+     * @param attempt 0=首次；失败后延迟 1.5s 重试一次。
+     *                LSPosed 的 handleLoadPackage 偶尔早于 Application.attach，
+     *                此时 currentApplication() 为 null，第一次必然拿不到 Context，
+     *                而「注入证据」恰恰是启动那几百毫秒里写的，不能就这么丢掉。
+     */
+    private static void providerLog(final String line, final int attempt) {
+        try {
+            android.content.Context ctx = currentApplication();
+            if (ctx == null) {
+                if (attempt == 0) {
+                    Thread t = new Thread(() -> {
+                        try {
+                            Thread.sleep(1500L);
+                        } catch (InterruptedException ignored) {
+                        }
+                        providerLog(line, 1);
+                    }, "antiburn-provider-retry");
+                    t.setDaemon(true);
+                    t.start();
+                }
+                return;
+            }
+            android.os.Bundle b = new android.os.Bundle();
+            b.putString(ConfigProvider.KEY_TOKEN, ConfigProvider.TOKEN);
+            b.putString(ConfigProvider.KEY_LOG, line);
+            ctx.getContentResolver().call(
+                    android.net.Uri.parse("content://" + ConfigProvider.AUTHORITY),
+                    ConfigProvider.METHOD_PUT_LOG, null, b);
+        } catch (Throwable ignored) {
+        }
+    }
+
+    /**
+     * 取当前进程的 Application。
+     *
+     * <p>v2.9.3：原先只有一条 `ActivityThread.currentApplication()` 的反射。Android 11+
+     * 的隐藏 API 限制会把它挡在 untrusted_app（抖音 / 快手 / 红果 / B站 全是）外面 ——
+     * 异常被静默吞掉，于是「注入进程的日志一条都进不了文件」，SELF 里 inject 恒为 0。
+     * 现在优先用 {@link AppContextHolder}：legacy 的 {@code AndroidAppHelper} 由框架
+     * 在自己的 ClassLoader 里提供，libxposed（API 102）没有等价类，所以本分支改成模块
+     * 自己在 {@code Application.<init>} 上抓实例 —— 构造器不走虚分派，任何 Application
+     * 子类都必经此处，拿到的就是这个进程唯一的 Application，且全程不碰隐藏 API。</p>
+     */
+    private static android.content.Context currentApplication() {
+        try {
+            android.content.Context c = AppContextHolder.currentApplication();
+            if (c != null) {
+                return c;
+            }
+        } catch (Throwable ignored) {
+            // 非 Xposed 环境 / 类不存在时走下面的反射兜底
+        }
+        try {
+            Object c = Class.forName("android.app.ActivityThread")
+                    .getMethod("currentApplication").invoke(null);
+            return (android.content.Context) c;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    /**
+     * 探测可写日志路径并缓存。
+     *
+     * <p>不能用 canWrite() 或「能打开就算可写」：/sdcard 走 FUSE，权限判定延迟到真正
+     * write 时才报 EPERM，SystemUI 又是 platform_app，很容易出现「打开成功、写入失败」。
+     * 所以这里真的写一行探测内容，写得进去才采用。</p>
+     *
+     * <p>探测失败不是永久结论：App 可能在 SystemUI 之后才把目录建好，冷却一段时间后重探。</p>
+     */
+    private static String logPath() {
+        if (probed) {
+            if (logPath != null) {
+                return logPath;
+            }
+            if (System.currentTimeMillis() - probeFailAt < PROBE_RETRY_MS) {
+                return null;
+            }
+        }
+        synchronized (XposedInit.class) {
+            if (probed && logPath != null) {
+                return logPath;
+            }
+            if (probed && System.currentTimeMillis() - probeFailAt < PROBE_RETRY_MS) {
+                return null;
+            }
+            String hit = null;
+            for (String p : LOG_PATHS) {
+                try {
+                    File f = new File(p);
+                    File parent = f.getParentFile();
+                    if (parent == null || !parent.exists()) {
+                        continue;
+                    }
+                    // 时间戳放行首：exportLogs() 按行首数字排序，旧格式以 # 开头会被过滤掉
+                    byte[] probe = (System.currentTimeMillis() + " # antiburn probe\n")
+                            .getBytes(StandardCharsets.UTF_8);
+                    try (FileOutputStream fo = new FileOutputStream(f, true)) {
+                        fo.write(probe);
+                        fo.flush();
+                    }
+                    hit = p;
+                    break;
+                } catch (Throwable ignored) {
+                    // 下一个候选
+                }
+            }
+            logPath = hit;
+            probed = true;
+            if (hit == null) {
+                probeFailAt = System.currentTimeMillis();
+            }
+            return hit;
+        }
+    }
+
+    /**
+     * 供 Hook 侧写自定义诊断文件（如直播页 View 树）。
+     * 旧版 DouyinHook.writeTreeFile() 直接写 /sdcard，抖音进程没有存储权限，文件从来不会生成。
+     * 这里按「用户目录 → 兜底目录」顺序尝试，失败再经 su 写入。
+     */
+    public static boolean writeSharedFile(String name, String content) {
+        byte[] data = content.getBytes(StandardCharsets.UTF_8);
+        String[] paths = {
+                ConfStore.LOG_DIR + "/" + name,
+                ConfStore.LOG_DIR_FALLBACK + "/" + name,
+                "/data/local/tmp/" + name,
+        };
+        for (String p : paths) {
+            try {
+                try (FileOutputStream fo = new FileOutputStream(p, false)) {
+                    fo.write(data);
+                }
+                return true;
+            } catch (Throwable ignored) {
+            }
+        }
+        String b64 = Base64.encodeToString(data, Base64.NO_WRAP);
+        // execSu 返回 boolean（进程是否成功退出），不要再和 null 比较
+        return ConfStore.execSu("mkdir -p \"" + ConfStore.LOG_DIR_FALLBACK + "\" \"" + ConfStore.LOG_DIR
+                + "\" 2>/dev/null; echo " + b64 + " | base64 -d > \"" + ConfStore.LOG_DIR + "/" + name
+                + "\" 2>/dev/null || echo " + b64 + " | base64 -d > /data/local/tmp/" + name);
+    }
+
+    @Override
+    public void handleLoadPackage(XC_LoadPackage.LoadPackageParam lpparam) {
+        String pkg = lpparam.packageName;
+        String proc = lpparam.processName;
+        // v2.8.7：入口探针，必须在任何其它类之前打。
+        // 这一行是区分两种「日志里什么都没有」的唯一手段：
+        //   有 ENTER 但没 INJECTED → 模块进来了，后面某处崩了；
+        //   连 ENTER 都没有         → LSPosed 压根没加载模块（作用域 / 注入链）。
+        // 之前几版都卡在这个二义性上，只能凭猜。
+        try {
+            diagForce("ENTER pkg=" + pkg + " proc=" + proc);
+        } catch (Throwable ignored) {
+            // 连日志都写不出去时，宁可继续走主流程，也不能因为这个探针把注入挡掉
+        }
+        // v2.8.0：包名识别收敛到 VideoApps 单一真源。渠道包 / 变体包
+        // （真机实证：抖音 com.ss.android.ugc.aweme.mobile、B站 com.bilibili.app.in）
+        // 此前被精确 equals 漏掉，LSPosed 不注入这些进程，App 内分区隐藏 100% 失效。
+        VideoApps.Kind kind = VideoApps.of(pkg);
+        if ("com.android.systemui".equals(pkg)) {
+            diagForce("INJECTED SystemUI process=" + proc);
+            // v2.8.2「改日志」：一次性写清这一版要靠什么判断「有没有注入」。
+            // 真机日志里若只有 INJECTED SystemUI、没有对应视频 App 的 INJECTED /
+            // HOOK-ATTACH，就说明 LSPosed 没把模块注入那些进程，DouyinHook 整条链
+            // 跑不到，真隐藏必然失效 —— 此时去看导出日志末尾的 SELF 汇总行与 MASK 行。
+            diagForce("SCOPE ver=" + BuildConfig.VERSION_NAME
+                    + " targets=douyin,phoenix.read,kuaishou,bilibili"
+                    + " hint=视频App进程需出现 INJECTED <app> 或 HOOK-ATTACH；没有就说明 LSPosed 作用域没勾，去「功能 › 通用 › 作用域自检」");
+            Log.i(TAG, "loaded into SystemUI, starting...");
+            try {
+                Controller.init(lpparam);
+                // 自换代码基线：记下这一代来自哪次更新，之后每 20s 对比一次安装时间
+                SelfReload.arm(XposedBridge.currentModule());
+            } catch (Throwable t) {
+                Log.e(TAG, "init failed", t);
+                diagForce("INIT FAILED SystemUI: " + Log.getStackTraceString(t));
+            }
+        } else if (kind == VideoApps.Kind.DOUYIN) {
+            diagForce("INJECTED Douyin process=" + proc + " pkg=" + pkg);
+            Log.i(TAG, "loaded into Douyin, starting...");
+            try {
+                DouyinHook.init(lpparam);
+            } catch (Throwable t) {
+                Log.e(TAG, "douyin init failed", t);
+                diagForce("INIT FAILED Douyin: " + Log.getStackTraceString(t));
+            }
+        } else if (kind == VideoApps.Kind.DRAMA) {
+            // 红果短剧（抖音旗下，国内版 com.phoenix.read / 谷歌版 com.phoenix.read.oversea.gp）：
+            // 复用抖音同一套视频页各区域隐藏逻辑
+            diagForce("INJECTED Drama process=" + proc + " pkg=" + pkg);
+            Log.i(TAG, "loaded into Hongguo Drama, starting...");
+            try {
+                DouyinHook.init(lpparam);
+            } catch (Throwable t) {
+                Log.e(TAG, "drama init failed", t);
+                diagForce("INIT FAILED Drama: " + Log.getStackTraceString(t));
+            }
+        } else if (kind == VideoApps.Kind.KUAISHOU) {
+            // 快手（v2.6.8）：正式接入周期隐藏。复用 DouyinHook 已验证的几何识别
+            // （右侧列 / 顶部 / 底部 / 角落），不写快手专属阈值、不误伤视频画面；
+            // 由快手总开关 + 共用区域开关门控，遮盖引擎下整体让位。
+            // 探针保留：诊断日志开启时导出 View 树，供真机把几何阈值精调到实际坐标。
+            diagForce("INJECTED Kuaishou process=" + proc + " pkg=" + pkg + " stage=2 hide-ready");
+            Log.i(TAG, "loaded into Kuaishou, hiding enabled (stage 2)...");
+            try {
+                DouyinHook.init(lpparam);
+            } catch (Throwable t) {
+                Log.e(TAG, "kuaishou hook init failed", t);
+                diagForce("INIT FAILED Kuaishou: " + Log.getStackTraceString(t));
+            }
+            try {
+                VideoAppProbe.init(lpparam, "kuaishou");
+            } catch (Throwable t) {
+                Log.e(TAG, "kuaishou probe init failed", t);
+                diagForce("PROBE FAILED Kuaishou: " + Log.getStackTraceString(t));
+            }
+        } else if (kind == VideoApps.Kind.BILIBILI) {
+            // 哔哩哔哩（v2.6.8）：与快手同一套路径，几何识别 + 周期隐藏 + 诊断探针。
+            diagForce("INJECTED Bilibili process=" + proc + " pkg=" + pkg + " stage=2 hide-ready");
+            Log.i(TAG, "loaded into Bilibili, hiding enabled (stage 2)...");
+            try {
+                DouyinHook.init(lpparam);
+            } catch (Throwable t) {
+                Log.e(TAG, "bilibili hook init failed", t);
+                diagForce("INIT FAILED Bilibili: " + Log.getStackTraceString(t));
+            }
+            try {
+                VideoAppProbe.init(lpparam, "bilibili");
+            } catch (Throwable t) {
+                Log.e(TAG, "bilibili probe init failed", t);
+                diagForce("PROBE FAILED Bilibili: " + Log.getStackTraceString(t));
+            }
+        }
+    }
+}

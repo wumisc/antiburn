@@ -1,0 +1,137 @@
+plugins {
+    id 'com.android.application'
+    // 版本统一由根工程 plugins{} 管理，避免两处版本不一致
+    id 'org.jetbrains.kotlin.plugin.compose'
+}
+
+android {
+    namespace 'io.github.wumisc.antiburn'
+    compileSdk 37
+
+    defaultConfig {
+        applicationId "io.github.wumisc.antiburn"
+        minSdk 33
+        targetSdk 37
+        versionCode 142
+        versionName "3.4.0"
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_21
+        targetCompatibility JavaVersion.VERSION_21
+    }
+
+    buildFeatures {
+        buildConfig true
+        compose true
+    }
+
+    // JVM 沙盒（Robolectric）：让 AppVisibilityStore / HealReceiver 这些纯逻辑
+    // 在假 Android 运行时里真跑一遍，不依赖真机。桌面图标、闹钟、通知都能断言。
+    testOptions {
+        unitTests {
+            includeAndroidResources = true
+            returnDefaultValues = true
+        }
+    }
+
+    signingConfigs {
+        /**
+         * 历史发布包一直用 debug.keystore 签（模块本身不要求上架商店）。
+         * 这里显式声明成 shared，release 与 debug 共用同一把，用户升级不用卸载。
+         *
+         * v3.4.0 起正式版改用独立 release key（见下方 release 配置），shared 保留给
+         * 「没有 keystore.properties 的开源编译者」兜底。
+         */
+        shared {
+            storeFile file('../debug.keystore')
+            storePassword 'android'
+            keyAlias 'androiddebugkey'
+            keyPassword 'android'
+        }
+        /**
+         * v3.4.0 正式版签名：key 与口令都放在工程根的 keystore.properties（**不入库**，
+         * .gitignore 已挡）。源码公开时别人拿不到 key，也签不出「同签名」的包。
+         * Cloudflare KV 里有一份加密备份，见 发布说明「签名密钥」一节。
+         */
+        release {
+            def propsFile = rootProject.file('keystore.properties')
+            if (propsFile.exists()) {
+                def props = new Properties()
+                propsFile.withInputStream { props.load(it) }
+                storeFile rootProject.file(props.getProperty('storeFile'))
+                storePassword props.getProperty('storePassword')
+                keyAlias props.getProperty('keyAlias')
+                keyPassword props.getProperty('keyPassword')
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            // v3.2.3 体积治理：34 MB 的 dex 不是「代码多」，是 debug 变体从不做
+            // 压缩/裁剪 —— Compose + Miuix 液态玻璃 + backdrop 三层库里大量用不到
+            // 的类全被原样打进包。开 R8 后只裁第三方，模块自身整包 keep（见
+            // proguard-rules.pro），所以 Hook 逻辑与反射字符串不受影响。
+            minifyEnabled true
+            shrinkResources true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'),
+                    'proguard-rules.pro'
+            // 有 keystore.properties 用正式 key；没有就退回 shared（debug），
+            // 保证 clone 下来直接 gradle assembleRelease 也能出包
+            signingConfig rootProject.file('keystore.properties').exists()
+                    ? signingConfigs.release
+                    : signingConfigs.shared
+        }
+    }
+}
+
+// AGP 9 内置 Kotlin：jvmTarget 默认取 compileOptions.targetCompatibility（此处为 21）。
+// 旧版额外的顶层 kotlin{} 块在 AGP 9 内置 Kotlin 下可能找不到扩展，导致配置阶段直接失败，故移除。
+
+dependencies {
+    // Compose
+    implementation 'androidx.activity:activity-compose:1.9.3'
+    def composeBom = platform('androidx.compose:compose-bom:2024.12.01')
+    implementation composeBom
+    implementation 'androidx.compose.ui:ui'
+    implementation 'androidx.compose.foundation:foundation'
+    implementation 'androidx.compose.material3:material3'
+    implementation 'androidx.compose.runtime:runtime'
+
+    // Miuix 液态玻璃（原生 drawBackdrop + blur + lens + vibrancy，0.9.4 锁定）
+    implementation 'top.yukonga.miuix.kmp:miuix-blur:0.9.4'
+    implementation 'top.yukonga.miuix.kmp:miuix-ui:0.9.4'
+    implementation 'top.yukonga.miuix.kmp:miuix-squircle:0.9.4'
+
+    // Kyant0 AndroidLiquidGlass 底层库（成品 LiquidBottomTabs 液态玻璃导航栏依赖，Maven Central）
+    implementation "io.github.kyant0:backdrop-android:2.0.1"
+    implementation "io.github.kyant0:shapes:1.2.1"
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3'
+
+    // LSPosed/Xposed API（仅编译期）：SystemUI/抖音/红果 Hook 引擎
+    compileOnly 'io.github.libxposed:api:102.0.0'
+
+    // Shizuku（线路 B）：api 提供 Shizuku.newProcess / 权限查询，
+    // provider 是 binder 中继（manifest 里注册 ShizukuProvider 才有用）。
+    // 两者都在 Maven Central 与阿里云镜像上有，版本锁 13.1.5。
+    implementation 'dev.rikka.shizuku:api:13.1.5'
+    implementation 'dev.rikka.shizuku:provider:13.1.5'
+
+    // 只在 test 编译进：JVM 沙盒
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation 'org.robolectric:robolectric:4.16'
+    // API102：入口类 extends XposedModule，compileOnly 不进 APK，但 JVM 沙盒要能加载入口类验证契约
+    testImplementation 'io.github.libxposed:api:102.0.0'
+    // compileSdk 37（Android 17）的 android.jar 删掉了 android.hardware.fingerprint.FingerprintManager，
+    // 而 Robolectric 的 ShadowApplication / ShadowNotificationManager 源码里还引用着它 →
+    // test 编译报 "cannot access FingerprintManager"。把 android-36 的 jar 只挂到 test 编译期补上这个类，
+    // 运行期 Robolectric 用的是 android-all jar（里面有），不影响主工程。
+    def sdkRoot = System.getenv('ANDROID_HOME') ?: System.getenv('ANDROID_SDK_ROOT')
+    if (sdkRoot != null) {
+        def legacyJar = file("$sdkRoot/platforms/android-36/android.jar")
+        if (legacyJar.exists()) {
+            testCompileOnly files(legacyJar)
+        }
+    }
+}

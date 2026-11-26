@@ -1,0 +1,60 @@
+name: 问题反馈
+description: 报告模块的 bug 或异常
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        请尽量填全，缺关键信息基本没法定位。
+        日志比描述更有用：App 首页 › 功能设置 › 诊断日志 › 导出，把 `antiburn.log` 拖进来。
+  - type: input
+    id: device
+    attributes:
+      label: 机型与系统
+      placeholder: Redmi K90 Ultra / HyperOS 4.0.0.15 / Android 17
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: 模块版本
+      placeholder: 3.4.0（vc142）
+    validations:
+      required: true
+  - type: input
+    id: lsposed
+    attributes:
+      label: LSPosed 版本
+      placeholder: 2.2.1 (7912, API102)
+    validations:
+      required: true
+  - type: dropdown
+    id: scope
+    attributes:
+      label: 作用域勾了哪些
+      multiple: true
+      options:
+        - 系统框架（com.android.systemui）
+        - 抖音（com.ss.android.ugc.aweme）
+        - 红果短剧（com.phoenix.read）
+        - 快手（com.smile.gifmaker）
+        - 哔哩哔哩（tv.danmaku.bili）
+        - 其它
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: 现象与复现
+      description: 做了什么、出现什么、什么时候出现。有截图更好。
+      placeholder: 进去快手合集页，底部那条固定栏没被遮住……
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 诊断日志
+      description: 拖入导出的 antiburn.log；太长的可只贴出问题的时段。
+    validations:
+      required: false

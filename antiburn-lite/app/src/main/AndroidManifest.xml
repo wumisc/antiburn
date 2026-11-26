@@ -1,0 +1,183 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- 枚举已安装应用（白名单选择界面）：Android 11+ 包可见性需要此权限，
+         HyperOS 上表现为"获取应用列表"运行时授权弹窗。 -->
+    <uses-permission
+        android:name="android.permission.QUERY_ALL_PACKAGES"
+        tools:ignore="QueryAllPackagesPermission" />
+
+    <!-- v3.0.8 P2：接收开机广播，用于恢复配置镜像与给用户可操作提示。
+         注意：这不等于「加了必自启」，国产 ROM 自启白名单仍需用户手动授权。 -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <!-- v3.0.24：常驻运行通知（前台服务）。用户要的是一条低频通知用来保后台，
+         所以必须声明 FOREGROUND_SERVICE 与 specialUse 子类型；
+         Android 13+ 还要 POST_NOTIFICATIONS 才能把通知显示出来。 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- v3.2.10：公益找孩子板块拉取宝贝回家规范化 JSON 与照片；仅这一个板块联网，
+         不上传任何本机信息。断网时回落到缓存 / 内置快照。 -->
+    <uses-permission android:name="android.permission.INTERNET" />
+
+    <!-- Android 11+ 包可见性兜底：即使部分 ROM 不授予「获取应用列表」，
+         至少能列出带桌面入口的应用，白名单选择页不会一片空白。 -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+        <!-- Shizuku：Android 11+ 不声明就查不到这个包，运行方式卡片会一直显示「未安装」 -->
+        <package android:name="moe.shizuku.privileged.api" />
+    </queries>
+
+    <application
+        android:name=".AbApplication"
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:description="@string/module_description"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.AntiburnLite">
+
+        <!-- 主界面：3 Tab（首页/功能/关于）+ Kyant0 液态玻璃导航栏 + 真实防烧屏开关 -->
+        <!-- 本体常驻 enabled/exported，不承载 LAUNCHER，作为 LSPosed/显式 intent 的稳定入口。
+             用成对标签（非自闭合 />）使守卫 slice 终止符 </activity> 能截全本体块。 -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <!-- v3.0.13 修复（P1）：隐藏桌面图标时 .LauncherAlias 被禁用，包内不再有任何
+                 MAIN + 桌面启动类目的组件，PackageManager.getLaunchIntentForPackage() 直接返回 null，
+                 LSPosed（AppHelper.getLaunchIntentForPackage 先查 INFO 类目）、系统设置
+                 「打开」与第三方启动器全部失效，用户被锁在 App 外。
+                 此处补一个 MAIN + INFO 类目的入口：桌面与启动器只解析桌面启动类目，
+                 故隐藏态仍不显示图标；而 getLaunchIntentForPackage 会优先命中本组件，
+                 使一切外部启动路径恢复。纯加性，不改可见性切换逻辑。 -->
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.INFO" />
+                <!-- v3.0.15：getLaunchIntentForPackage 的 INFO 查询带 MATCH_DEFAULT_ONLY，
+                     不声明 DEFAULT 类目的 filter 不会被匹配，LSPosed 仍拿不到启动 Intent。
+                     补上后隐藏图标态也能被「打开」；桌面只解析桌面类目，故不显示图标。 -->
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
+        <!-- v3.0.11 P1：可切换桌面入口。隐藏态禁 alias 后桌面不再有图标；
+             外部启动能力由 .MainActivity 的 CATEGORY_INFO 入口承担（v3.0.13 修复）。 -->
+        <activity-alias
+            android:name=".LauncherAlias"
+            android:targetActivity=".MainActivity"
+            android:enabled="true"
+            android:exported="true"
+            android:icon="@mipmap/ic_launcher"
+            android:label="@string/app_name">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
+        <!-- v3.0.8 P2：开机 / 覆盖安装后恢复。exported=true 是 Android 12+ 带 intent-filter 的强制要求，
+             BOOT_COMPLETED 只能由系统发出；Receiver 内仍白名单校验 action，工作幂等无害。 -->
+        <receiver
+            android:name=".BootReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- 白名单图形化选择：搜索+勾选应用，避免手动填包名。居中小窗，不占全屏 -->
+        <activity
+            android:name=".WhitelistPickerActivity"
+            android:exported="false"
+            android:theme="@style/Theme.AntiburnLite.Dialog" />
+
+        <!-- 快捷开关磁贴：点击改写 enable_status，模块周期轮询一个周期内生效 -->
+        <service
+            android:name=".AntiburnTile"
+            android:exported="true"
+            android:icon="@drawable/ic_tile"
+            android:label="@string/tile_label"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
+
+        <!-- v3.0.24：常驻运行通知。只发一条通知、3 小时刷新一次，
+             目的不是监控而是保后台；specialUse 是 Android 14+ 对「无合适类型」的
+             前台服务唯一合法入口，属性值写清楚用途供系统审核。 -->
+        <service
+            android:name=".GuardService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="oled_burn_in_protection_daemon" />
+        </service>
+
+        <!-- 免 root 遮盖引擎（线路 A）。必须由用户在系统设置里手动开启，或走线路 B 的
+             Shizuku 授权代开；BIND_ACCESSIBILITY_SERVICE 保证只有系统能绑定它。 -->
+        <service
+            android:name=".BurnInMaskService"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_service_config" />
+        </service>
+
+        <!-- 线路 B：Shizuku 的 binder 中继。没有它，普通应用拿不到 Shizuku 的 binder，
+             checkSelfPermission / newProcess 全部不可用。authorities 必须以 applicationId
+             开头，Shizuku 按这个规则反查调用方。 -->
+        <provider
+            android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="${applicationId}.shizuku"
+            android:enabled="true"
+            android:exported="true"
+            android:multiprocess="false"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL"
+            tools:ignore="ProtectedPermissions" />
+
+        <!-- 被 Hook 的进程无法直接读 /data/local/tmp（SELinux shell_data_file），
+             通过此导出的 provider 读取「应用内镜像」配置文本，设置才能真正生效。
+             只暴露一小段开关文本，不提供 query/insert/update/delete。 -->
+        <provider
+            android:name=".ConfigProvider"
+            android:authorities="io.github.wumisc.antiburn.config"
+            android:exported="true" />
+
+        <!--
+          LSPosed 模块声明：隐藏功能在 SystemUI / 抖音 / 红果 / 快手 / B站 进程内 Hook 生效。
+          v2.6.8：快手 / B站 正式接入周期隐藏。
+          v3.2.25：改用 libxposed（API 102）身份：模块声明在 resources/META-INF/xposed/，
+          名字/描述取 application 的 label / description，不再有 xposedmodule / xposedscope。
+        -->
+        
+
+        <!-- v3.2.25 保命：常驻服务被系统回收后自己爬回来。
+             45 秒快速刀 + 15 分钟兜底巡检（不精确闹钟，不申请精确闹钟权限），
+             外加通知上的「立即恢复」按钮。用户主动点停止后不再自愈。 -->
+        <receiver
+            android:name=".HealReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="io.github.wumisc.antiburn.HEAL" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+    </application>
+
+</manifest>

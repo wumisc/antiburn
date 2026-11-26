@@ -1,0 +1,301 @@
+package io.github.wumisc.antiburn;
+
+import android.app.Activity;
+import android.content.Context;
+import android.content.Intent;
+import android.content.SharedPreferences;
+import android.content.pm.ApplicationInfo;
+import android.content.pm.PackageManager;
+import android.content.pm.ResolveInfo;
+import android.graphics.drawable.Drawable;
+import android.os.Bundle;
+import android.text.Editable;
+import android.text.TextWatcher;
+import android.view.LayoutInflater;
+import android.view.View;
+import android.view.ViewGroup;
+import android.widget.BaseAdapter;
+import android.widget.CheckBox;
+import android.widget.EditText;
+import android.widget.ImageView;
+import android.widget.ListView;
+import android.widget.TextView;
+import android.widget.Toast;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+
+/**
+ * 图形化名单选择：搜索 + 勾选应用，新用户无需知道包名。
+ *
+ * <p>v2.8 起同一个页面服务两种模式，由 Intent extra {@link #EXTRA_MODE} 决定：
+ * 白名单语义是「名单内应用前台时不做防烧屏」，黑名单语义正好相反（只有名单内才做）。
+ * 两者数据分开存（whitelist= / blacklist=），切换模式互不覆盖。</p>
+ *
+ * <p>Android 11+ 包可见性：枚举已安装应用依赖 QUERY_ALL_PACKAGES 权限
+ * （HyperOS 上表现为"获取应用列表"运行时授权）。此处主动申请并在授权后重载，
+ * 避免授权了仍看不到应用列表。</p>
+ */
+public final class WhitelistPickerActivity extends Activity {
+
+    /** 由调用方传入 white / black，缺省 white，保持旧调用点的行为 */
+    public static final String EXTRA_MODE = "extra_list_mode";
+    private static final String PREFS = "antiburn_prefs";
+    private static final String KEY = "list_apps";
+    private static final String QUERY_PERM = "android.permission.QUERY_ALL_PACKAGES";
+    private static final int REQ_QUERY_ALL = 1;
+
+    private static class AppItem {
+        String pkg;
+        CharSequence label;
+        Drawable icon;
+        boolean system;
+    }
+
+    private final List<AppItem> all = new ArrayList<>();
+    /** v2.5：onCreate 已加载过就不在 onResume 重复跑（图标加载在主线程，会卡顿/ANR） */
+    private boolean appsLoaded;
+    private final List<AppItem> shown = new ArrayList<>();
+    private final Set<String> selected = new HashSet<>();
+    private AppAdapter adapter;
+    /** 当前编辑哪一份名单：white / black（off 模式进不来，由调用方拦掉） */
+    private String mode = ConfStore.MODE_WHITE;
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        ConfStore.init(this);
+        mode = ConfStore.normMode(getIntent().getStringExtra(EXTRA_MODE));
+        if (ConfStore.MODE_OFF.equals(mode)) {
+            mode = ConfStore.MODE_WHITE; // off 模式没有名单可编辑，兜底成白名单
+        }
+        // 修复：旧版只从 SharedPreferences 读勾选状态，conf 里已有的名单会被当成"没选"，
+        // 用户点保存后直接把原名单清空。现在以配置镜像为权威来源，prefs 仅作兜底。
+        String mirror = ConfStore.readMirror();
+        if (mirror != null && !mirror.trim().isEmpty()) {
+            ConfStore.Lists lists = ConfStore.readLists(mirror);
+            selected.addAll(ConfStore.MODE_BLACK.equals(mode) ? lists.black : lists.white);
+        } else {
+            Set<String> saved = getPrefs().getStringSet(prefsKey(), null);
+            if (saved == null && ConfStore.MODE_WHITE.equals(mode)) {
+                // v2.8 换了 prefs 键名，旧安装的勾选记录仍能兜底读回一次
+                saved = getPrefs().getStringSet("whitelist_apps", null);
+            }
+            if (saved != null) {
+                selected.addAll(saved);
+            }
+        }
+        setContentView(R.layout.activity_whitelist_picker);
+        String title = "选择" + listName() + "应用";
+        setTitle(title);
+        // 布局里的标题控件也要跟着模式变，否则窗体内仍是「白名单」字样
+        ((TextView) findViewById(R.id.wl_title)).setText(title);
+        // 必须在 setContentView 之后设置小窗尺寸，否则会被 Dialog 主题重算覆盖
+        getWindow().setLayout(
+                (int) (getResources().getDisplayMetrics().widthPixels * 0.9f),
+                android.view.WindowManager.LayoutParams.WRAP_CONTENT);
+
+        ListView lv = findViewById(R.id.wl_list);
+        // 空列表提示：未获取到应用时引导检查权限
+        lv.setEmptyView(findViewById(R.id.wl_empty));
+        adapter = new AppAdapter();
+        lv.setAdapter(adapter);
+        lv.setOnItemClickListener((parent, view, pos, id) -> {
+            AppItem a = shown.get(pos);
+            if (selected.contains(a.pkg)) selected.remove(a.pkg);
+            else selected.add(a.pkg);
+            adapter.notifyDataSetChanged();
+        });
+
+        EditText search = findViewById(R.id.wl_search);
+        search.addTextChangedListener(new TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence s, int a, int b, int c) { }
+            @Override public void onTextChanged(CharSequence s, int a, int b, int c) {
+                applyFilter(s.toString());
+            }
+            @Override public void afterTextChanged(Editable s) { }
+        });
+
+        CheckBox sysCb = findViewById(R.id.wl_show_system);
+        sysCb.setOnCheckedChangeListener((btn, on) ->
+                applyFilter(search.getText().toString()));
+
+        findViewById(R.id.wl_btn_save).setOnClickListener(v -> saveSelection());
+        findViewById(R.id.wl_btn_cancel).setOnClickListener(v -> finish());
+
+        requestQueryPermIfNeeded();
+        loadApps(); // 首次加载
+    }
+
+    /** 落地名单：写 prefs（回填勾选）+ 写 conf 镜像/系统配置。失败时不关闭页面，允许重试。 */
+    private void saveSelection() {
+        View btn = findViewById(R.id.wl_btn_save);
+        btn.setEnabled(false);
+        getPrefs().edit().putStringSet(prefsKey(), new HashSet<>(selected)).apply();
+        final Set<String> snapshot = new HashSet<>(selected);
+        final String name = listName();
+        Toast.makeText(this, "正在保存 " + snapshot.size() + " 个" + name + "应用...", Toast.LENGTH_SHORT).show();
+        new Thread(() -> {
+            // 只改当前模式那一份，另一份原样保留；模式键与两份名单同一次落盘
+            boolean ok = ConfStore.replaceListOne(mode, snapshot);
+            runOnUiThread(() -> {
+                btn.setEnabled(true);
+                if (ok) {
+                    Toast.makeText(this, "已保存：" + snapshot.size() + " 个" + name + "应用", Toast.LENGTH_SHORT).show();
+                    setResult(RESULT_OK);
+                    finish();
+                } else {
+                    // 旧版失败也 finish()，用户勾选全部丢失且无法重试
+                    Toast.makeText(this, "保存失败：无法写入应用配置，请重试或检查 root 授权",
+                            Toast.LENGTH_LONG).show();
+                }
+            });
+        }).start();
+    }
+
+    private String prefsKey() {
+        return KEY + "_" + mode;
+    }
+
+    private String listName() {
+        return ConfStore.MODE_BLACK.equals(mode) ? "黑名单" : "白名单";
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        // v2.5：应用列表已加载就不再重复；只有权限变化会显式置 false 后重跑
+        if (!appsLoaded) {
+            loadApps();
+        }
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int code, String[] perms, int[] results) {
+        super.onRequestPermissionsResult(code, perms, results);
+        if (code == REQ_QUERY_ALL) {
+            appsLoaded = false;
+            loadApps();
+        }
+    }
+
+    /**
+     * QUERY_ALL_PACKAGES 是安装时即授予的 normal 权限，requestPermissions 不会弹窗，
+     * 反而会立刻回调 onRequestPermissionsResult，导致应用列表被重复加载两次。
+     * 清单里的 <queries>（MAIN/LAUNCHER）已经保证带桌面入口的应用可见，这里不再做无效申请。
+     */
+    private void requestQueryPermIfNeeded() {
+        // 有意留空：保留调用点以便后续接厂商「获取应用列表」设置页
+    }
+
+    private SharedPreferences getPrefs() {
+        return getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+    }
+
+    private void loadApps() {
+        if (appsLoaded) {
+            return;
+        }
+        appsLoaded = true;
+        all.clear();
+        PackageManager pm = getPackageManager();
+        boolean granted = checkSelfPermission(QUERY_PERM) == PackageManager.PERMISSION_GRANTED;
+
+        // 主路径：带桌面入口的应用（图标直观、无需包名）
+        Intent main = new Intent(Intent.ACTION_MAIN);
+        main.addCategory(Intent.CATEGORY_LAUNCHER);
+        List<ResolveInfo> list = pm.queryIntentActivities(main, 0);
+        for (ResolveInfo ri : list) {
+            try {
+                ApplicationInfo ai = ri.activityInfo.applicationInfo;
+                AppItem a = new AppItem();
+                a.pkg = ri.activityInfo.packageName;
+                a.label = ri.loadLabel(pm);
+                a.icon = ri.loadIcon(pm);
+                a.system = (ai.flags & ApplicationInfo.FLAG_SYSTEM) != 0;
+                all.add(a);
+            } catch (Throwable ignored) { }
+        }
+        // 兜底：queryIntentActivities 受限时改用 getInstalledApplications 过滤出有启动入口的
+        if (all.isEmpty()) {
+            try {
+                for (ApplicationInfo ai : pm.getInstalledApplications(0)) {
+                    try {
+                        Intent li = pm.getLaunchIntentForPackage(ai.packageName);
+                        // 已拿到应用列表权限时不再要求桌面入口，避免无图标应用被漏掉
+                        if (!granted && li == null) continue;
+                        AppItem a = new AppItem();
+                        a.pkg = ai.packageName;
+                        a.label = ai.loadLabel(pm);
+                        a.icon = ai.loadIcon(pm);
+                        a.system = (ai.flags & ApplicationInfo.FLAG_SYSTEM) != 0;
+                        all.add(a);
+                    } catch (Throwable ignored) { }
+                }
+            } catch (Throwable t) {
+                // ignore
+            }
+        }
+        // 同包多入口去重，按名称排序
+        Set<String> seen = new HashSet<>();
+        List<AppItem> uniq = new ArrayList<>();
+        for (AppItem a : all) if (seen.add(a.pkg)) uniq.add(a);
+        all.clear();
+        all.addAll(uniq);
+        Collections.sort(all, (x, y) ->
+                String.valueOf(x.label).compareToIgnoreCase(String.valueOf(y.label)));
+
+        applyFilter("");
+
+        // 空提示文案：区分"没权限"与"确实没应用"
+        TextView empty = findViewById(R.id.wl_empty);
+        if (all.isEmpty()) {
+            empty.setText(granted
+                    ? "未获取到应用（可能无带桌面入口的应用）"
+                    : "未获取到应用：请授予本 App「获取应用列表」权限后重试");
+        }
+    }
+
+    private void applyFilter(String q) {
+        shown.clear();
+        boolean showSys = ((CheckBox) findViewById(R.id.wl_show_system)).isChecked();
+        String query = q == null ? "" : q.trim().toLowerCase();
+        for (AppItem a : all) {
+            if (!showSys && a.system) continue;
+            if (query.isEmpty()
+                    || String.valueOf(a.label).toLowerCase().contains(query)
+                    || a.pkg.toLowerCase().contains(query)) {
+                shown.add(a);
+            }
+        }
+        adapter.notifyDataSetChanged();
+        TextView empty = findViewById(R.id.wl_empty);
+        if (shown.isEmpty() && !all.isEmpty()) {
+            empty.setText("无匹配应用");
+        }
+    }
+
+    private final class AppAdapter extends BaseAdapter {
+        @Override public int getCount() { return shown.size(); }
+        @Override public Object getItem(int i) { return shown.get(i); }
+        @Override public long getItemId(int i) { return i; }
+
+        @Override
+        public View getView(int i, View cv, ViewGroup parent) {
+            if (cv == null) {
+                cv = LayoutInflater.from(WhitelistPickerActivity.this)
+                        .inflate(R.layout.item_whitelist_pick, parent, false);
+            }
+            AppItem a = shown.get(i);
+            ((ImageView) cv.findViewById(R.id.wl_item_icon)).setImageDrawable(a.icon);
+            ((TextView) cv.findViewById(R.id.wl_item_label)).setText(a.label);
+            TextView pkg = cv.findViewById(R.id.wl_item_pkg);
+            pkg.setText(a.pkg + (a.system ? "  · 系统" : ""));
+            ((CheckBox) cv.findViewById(R.id.wl_item_check)).setChecked(selected.contains(a.pkg));
+            return cv;
+        }
+    }
+}
